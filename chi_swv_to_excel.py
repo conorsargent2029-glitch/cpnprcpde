@@ -20,7 +20,7 @@ real stage label (e.g. "BlankRegen"), then reduces it to a base concentration
 A new "round" starts every time the base concentration changes. Within a
 round, the first row is labeled with the concentration name and each
 following row is labeled in MINS_STEP-minute increments (see CONFIG --
-currently 3 mins, 6 mins, ...) -- one row per run, no filler rows for time
+currently 5 mins, 10 mins, ...) -- one row per run, no filler rows for time
 points that never happened.
 
 Each cycle's frequencies (e.g. 10/60Hz) are saved back-to-back
@@ -85,7 +85,7 @@ DEFAULT_EXCEL_NAME = "SWV_Results.xlsx"          # used if you just press Enter 
 DEFAULT_WATCH_FOLDER = r"C:\Users\gao22\OneDrive\Desktop\Conor\07162026 SWV final figure regen\patch 2"
 FREQUENCIES = [10, 60]  # the SWV frequencies your macro runs per cycle, in order --
                         # edit this list if a future protocol uses a different set
-MINS_STEP = 3  # minutes added to the label for each run within a round (blank, 3 mins, 6 mins, ...)
+MINS_STEP = 5  # minutes added to the label for each run within a round (blank, 5 mins, 10 mins, ...)
 POLL_SECONDS = 2.0        # how often to check the folder for new files
 LABEL_MATCH_WINDOW = 3.0  # seconds -- how close a named .bin's timestamp must be to the .txt's
 GROUP_GAP_SECONDS = 200.0  # max span from the first to the last frequency in one cycle to still
