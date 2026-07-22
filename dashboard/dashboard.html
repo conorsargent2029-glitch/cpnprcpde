@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>CHI SWV Live Results</title>
+<style>
+  :root {
+    color-scheme: light;
+    --surface-1:      #fcfcfb;
+    --page:           #f9f9f7;
+    --text-primary:   #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted:     #898781;
+    --grid:           #e1e0d9;
+    --axis:           #c3c2b7;
+    --border:         rgba(11,11,11,0.10);
+    --warning:        #fab219;
+    --warning-text:   #7a5200;
+    --series-1: #2a78d6; /* Ch1 blue */
+    --series-2: #1baf7a; /* Ch2 aqua */
+    --series-3: #eda100; /* Ch3 yellow */
+    --series-4: #008300; /* Ch4 green */
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --surface-1:      #1a1a19;
+      --page:           #0d0d0d;
+      --text-primary:   #ffffff;
+      --text-secondary: #c3c2b7;
+      --text-muted:     #898781;
+      --grid:           #2c2c2a;
+      --axis:           #383835;
+      --border:         rgba(255,255,255,0.10);
+      --warning:        #c98500;
+      --warning-text:   #ffd580;
+      --series-1: #3987e5;
+      --series-2: #199e70;
+      --series-3: #c98500;
+      --series-4: #008300;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: var(--page);
+    color: var(--text-primary);
+  }
+  .wrap { max-width: 1200px; margin: 0 auto; padding: 20px 20px 60px; }
+  header { margin-bottom: 16px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .meta { color: var(--text-secondary); font-size: 13px; line-height: 1.6; }
+  .meta code { background: var(--border); padding: 1px 5px; border-radius: 4px; }
+  .stat-row { display: flex; gap: 12px; margin: 14px 0 20px; flex-wrap: wrap; }
+  .stat {
+    background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px;
+    padding: 10px 16px; min-width: 120px;
+  }
+  .stat .label { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: .04em; }
+  .stat .value { font-size: 18px; font-weight: 600; margin-top: 2px; font-variant-numeric: tabular-nums; }
+  .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; margin-bottom: 24px; }
+  .panel {
+    background: var(--surface-1); border: 1px solid var(--border); border-radius: 12px;
+    padding: 14px 16px 8px;
+  }
+  .panel h2 { font-size: 14px; margin: 0 0 8px; color: var(--text-primary); }
+  .legend { display: flex; gap: 14px; margin-bottom: 6px; flex-wrap: wrap; }
+  .legend-item { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-secondary); }
+  .swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+  svg text { fill: var(--text-muted); font-size: 10px; font-family: inherit; }
+  .gridline { stroke: var(--grid); stroke-width: 1; }
+  .axisline { stroke: var(--axis); stroke-width: 1; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; background: var(--surface-1);
+          border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+  thead th {
+    position: sticky; top: 0; background: var(--surface-1);
+    text-align: right; padding: 8px 10px; font-size: 11px; color: var(--text-muted);
+    text-transform: uppercase; letter-spacing: .03em; border-bottom: 1px solid var(--border);
+  }
+  thead th:first-child, thead th.run-col { text-align: left; }
+  tbody td {
+    padding: 6px 10px; text-align: right; font-variant-numeric: tabular-nums;
+    border-bottom: 1px solid var(--border); white-space: nowrap;
+  }
+  tbody td:first-child, td.run-col { text-align: left; }
+  tbody tr:nth-child(even) { background: color-mix(in srgb, var(--text-primary) 2%, transparent); }
+  tbody tr.flagged { background: color-mix(in srgb, var(--warning) 18%, transparent); }
+  .badge {
+    display: inline-block; font-size: 10px; font-weight: 600; color: var(--warning-text);
+    background: color-mix(in srgb, var(--warning) 30%, transparent);
+    border-radius: 4px; padding: 1px 5px; margin-left: 6px;
+  }
+  .empty-cell { color: var(--text-muted); }
+  .estimated { font-style: italic; cursor: help; }
+  .estimated sup { color: var(--text-muted); font-style: normal; margin-left: 1px; }
+  #status { font-size: 12px; color: var(--text-muted); margin-top: 24px; text-align: center; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header style="display:flex; justify-content:space-between; align-items:flex-start; gap:16px; flex-wrap:wrap;">
+    <div>
+      <h1>CHI SWV Live Results</h1>
+      <div class="meta">
+        Watching <code id="watchFolder">&mdash;</code><br>
+        Writing to <code id="excelPath">&mdash;</code>
+      </div>
+    </div>
+    <div id="qrBox" style="text-align:center; display:none;">
+      <img id="qrImg" src="qr.svg" width="110" height="110" style="background:#fff; border-radius:8px; padding:6px;"
+           onerror="document.getElementById('qrBox').style.display='none'"
+           onload="document.getElementById('qrBox').style.display='block'">
+      <div style="font-size:11px; color:var(--text-muted); margin-top:4px;">Scan for phone</div>
+    </div>
+  </header>
+
+  <div class="stat-row">
+    <div class="stat"><div class="label">Rows</div><div class="value" id="statRows">0</div></div>
+    <div class="stat"><div class="label">Current round</div><div class="value" id="statRound">&mdash;</div></div>
+    <div class="stat"><div class="label">Flagged for review</div><div class="value" id="statFlagged">0</div></div>
+    <div class="stat"><div class="label">Last updated</div><div class="value" id="statUpdated">&mdash;</div></div>
+  </div>
+
+  <div class="charts" id="chartsContainer"></div>
+
+  <table>
+    <thead>
+      <tr id="theadRow"><th class="run-col">Run</th></tr>
+    </thead>
+    <tbody id="tableBody"></tbody>
+  </table>
+  <div class="meta" style="margin-top:8px;"><em>italic<sup>~</sup></em> = CHI found no Difference peak for that channel; value estimated from the raw difference-curve data instead.</div>
+
+  <div id="status">Loading&hellip;</div>
+</div>
+
+<script>
+const SERIES_COLORS = ["var(--series-1)", "var(--series-2)", "var(--series-3)", "var(--series-4)"];
+const SERIES_NAMES = ["Ch1", "Ch2", "Ch3", "Ch4"];
+
+function fmtSci(v) {
+  if (v === null || v === undefined) return null;
+  return v.toExponential(2).replace("e", "E").replace(/E([+-])(\d)$/, "E$10$2");
+}
+
+let knownFreqsKey = null;
+
+function ensureLayout(freqs) {
+  const key = freqs.join(",");
+  if (knownFreqsKey === key) return;
+  knownFreqsKey = key;
+
+  document.getElementById("chartsContainer").innerHTML = freqs.map(f => `
+    <div class="panel">
+      <h2>${f} Hz &mdash; ip (A)</h2>
+      <div class="legend" id="legend-${f}"></div>
+      <div id="chart-${f}"></div>
+    </div>`).join("");
+  freqs.forEach(f => renderLegend(`legend-${f}`));
+
+  document.getElementById("theadRow").innerHTML = '<th class="run-col">Run</th>' +
+    freqs.map(f => SERIES_NAMES.map(name => `<th>${f}Hz ${name}</th>`).join("")).join("");
+}
+
+function renderLegend(containerId) {
+  const el = document.getElementById(containerId);
+  el.innerHTML = SERIES_NAMES.map((name, i) =>
+    `<span class="legend-item"><span class="swatch" style="background:${SERIES_COLORS[i]}"></span>${name}</span>`
+  ).join("");
+}
+
+function buildChart(rows, freq) {
+  const W = 520, H = 220, padL = 54, padR = 10, padT = 10, padB = 24;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+
+  const seriesData = [0, 1, 2, 3].map(ch =>
+    rows.map((r, i) => {
+      const s = r.series && r.series[String(freq)];
+      const v = s ? s.ip[ch] : null;
+      return (v === null || v === undefined) ? null : { x: i, y: v };
+    })
+  );
+
+  const allVals = seriesData.flat().filter(p => p !== null).map(p => p.y);
+  if (allVals.length === 0) {
+    return `<svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}"><text x="${W/2}" y="${H/2}" text-anchor="middle">No data yet</text></svg>`;
+  }
+  let yMin = Math.min(...allVals), yMax = Math.max(...allVals);
+  if (yMin === yMax) { yMin -= Math.abs(yMin) * 0.1 || 1e-9; yMax += Math.abs(yMax) * 0.1 || 1e-9; }
+  const yPad = (yMax - yMin) * 0.08;
+  yMin -= yPad; yMax += yPad;
+
+  const n = rows.length;
+  const xOf = i => padL + (n <= 1 ? plotW / 2 : (i / (n - 1)) * plotW);
+  const yOf = v => padT + plotH - ((v - yMin) / (yMax - yMin)) * plotH;
+
+  let gridlines = "", yLabels = "";
+  const steps = 4;
+  for (let s = 0; s <= steps; s++) {
+    const v = yMin + (s / steps) * (yMax - yMin);
+    const y = yOf(v);
+    gridlines += `<line class="gridline" x1="${padL}" x2="${W - padR}" y1="${y}" y2="${y}" />`;
+    yLabels += `<text x="${padL - 6}" y="${y + 3}" text-anchor="end">${fmtSci(v)}</text>`;
+  }
+
+  const xTickEvery = Math.max(1, Math.ceil(n / 8));
+  let xLabels = "";
+  for (let i = 0; i < n; i += xTickEvery) {
+    xLabels += `<text x="${xOf(i)}" y="${H - 6}" text-anchor="middle">${escapeXml(rows[i].label)}</text>`;
+  }
+
+  let paths = "", points = "";
+  seriesData.forEach((series, ch) => {
+    let d = "", drawing = false;
+    series.forEach(p => {
+      if (p === null) { drawing = false; return; }
+      const x = xOf(p.x), y = yOf(p.y);
+      d += (drawing ? "L" : "M") + x.toFixed(1) + "," + y.toFixed(1) + " ";
+      drawing = true;
+      const flagged = rows[p.x].flagged;
+      points += `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="${flagged ? 4 : 3}" fill="${SERIES_COLORS[ch]}" ${flagged ? 'stroke="var(--warning)" stroke-width="2"' : ''}><title>${escapeXml(rows[p.x].label)} - ${SERIES_NAMES[ch]}: ${fmtSci(p.y)} A</title></circle>`;
+    });
+    paths += `<path d="${d}" fill="none" stroke="${SERIES_COLORS[ch]}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />`;
+  });
+
+  return `<svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}">
+    ${gridlines}
+    <line class="axisline" x1="${padL}" x2="${padL}" y1="${padT}" y2="${H - padB}" />
+    <line class="axisline" x1="${padL}" x2="${W - padR}" y1="${H - padB}" y2="${H - padB}" />
+    ${yLabels}
+    ${xLabels}
+    ${paths}
+    ${points}
+  </svg>`;
+}
+
+function escapeXml(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function renderCells(values, estimated) {
+  const est = estimated || [false, false, false, false];
+  return values.map((v, i) => {
+    if (v === null || v === undefined) return `<td class="empty-cell">&mdash;</td>`;
+    if (est[i]) return `<td class="estimated" title="CHI didn't report a Difference peak for this channel -- estimated from the raw difference-curve data instead">${fmtSci(v)}<sup>~</sup></td>`;
+    return `<td>${fmtSci(v)}</td>`;
+  }).join("");
+}
+
+function renderTable(rows, freqs) {
+  const body = document.getElementById("tableBody");
+  body.innerHTML = rows.slice().reverse().map(r => {
+    const cells = freqs.map(f => {
+      const s = (r.series && r.series[String(f)]) || {};
+      return renderCells(s.ip || [null, null, null, null], s.estimated);
+    }).join("");
+    const badge = r.flagged ? `<span class="badge">&#9888; review</span>` : "";
+    return `<tr class="${r.flagged ? 'flagged' : ''}"><td class="run-col">${escapeXml(r.label)}${badge}</td>${cells}</tr>`;
+  }).join("");
+}
+
+async function tick() {
+  try {
+    const res = await fetch("data.json?t=" + Date.now(), { cache: "no-store" });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    const rows = data.rows || [];
+    const freqs = data.frequencies || [];
+
+    ensureLayout(freqs);
+
+    document.getElementById("watchFolder").textContent = data.watch_folder || "—";
+    document.getElementById("excelPath").textContent = data.excel_path || "—";
+    document.getElementById("statRows").textContent = rows.length;
+    document.getElementById("statRound").textContent = data.current_round || "—";
+    document.getElementById("statFlagged").textContent = rows.filter(r => r.flagged).length;
+    document.getElementById("statUpdated").textContent = data.updated_at
+      ? new Date(data.updated_at).toLocaleTimeString() : "—";
+
+    freqs.forEach(f => {
+      const el = document.getElementById(`chart-${f}`);
+      if (el) el.innerHTML = buildChart(rows, f);
+    });
+    renderTable(rows, freqs);
+
+    document.getElementById("status").textContent = "Auto-refreshing every 3s — last check " + new Date().toLocaleTimeString();
+  } catch (e) {
+    document.getElementById("status").textContent = "Waiting for data.json (watcher not started yet?) — " + e.message;
+  }
+}
+
+tick();
+setInterval(tick, 3000);
+</script>
+</body>
+</html>
