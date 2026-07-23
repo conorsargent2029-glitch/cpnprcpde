@@ -35,13 +35,18 @@ algorithm, so treat these numbers as approximate, not lab-final.
 
 How labeling works
 -------------------
-Files are grouped into cycles by save time (not by the number CHI appends
-to the filename, which isn't guaranteed to be chronological -- same
-reasoning as chi_swv_to_excel.py). A cycle is one row: whichever
-frequencies in FREQUENCIES were saved within GROUP_GAP_SECONDS of each
-other. The first cycle is labeled FIRST_LABEL ("initial reading" by
-default); every cycle after that is labeled in STEP_MINUTES increments
-(20 mins, 40 mins, ...) -- one row per cycle, no filler rows.
+Files are paired into cycles by the number CHI appends to the filename
+(e.g. "10hz_blank_5.bin" pairs with "60hz_blank_5.bin" -- both are cycle
+5), NOT by file timestamp. Timestamps turned out to be unreliable for
+this: if a folder gets reorganized/moved after the fact (copying files on
+Windows resets creation time) or synced by OneDrive, the save-time order
+timestamps imply can end up completely scrambled, badly mispairing rows.
+CHI doesn't suffix the very first save of a given name, only repeats get
+_2, _3, ... -- so a filename with no trailing number is treated as cycle 1.
+Cycles are then written out in ascending cycle-number order: the first is
+labeled FIRST_LABEL ("initial reading" by default), every one after in
+STEP_MINUTES increments (20 mins, 40 mins, ...) -- one row per cycle, no
+filler rows for a cycle where one frequency's file is missing entirely.
 
 DAILY USE
 ---------
@@ -70,7 +75,6 @@ DEFAULT_EXCEL_NAME = "Overnight_SWV_Results.xlsx"
 FREQUENCIES = [10, 60]     # the SWV frequencies to look for, in column order left to right
 DEFAULT_STEP_MINUTES = 20  # minutes between readings
 DEFAULT_FIRST_LABEL = "initial reading"
-GROUP_GAP_SECONDS = 200.0  # max span between a cycle's frequencies to still count as one row
 SETTINGS_DIR = r"C:\Users\gao22\Documents"  # where "last used" choices are remembered
 # --------------------------------------------------------
 
@@ -193,9 +197,6 @@ BIN_CH1_POINT_BYTES = 12   # one (i1d, i1f, i1r) float32 triplet per data point
 BIN_REST_POINT_BYTES = 36  # one (i2d,i2f,i2r, i3d,i3f,i3r, i4d,i4f,i4r) block per data point
 BIN_BYTES_PER_POINT = BIN_CH1_POINT_BYTES + BIN_REST_POINT_BYTES  # 48
 
-HZ_PREFIX_RE = re.compile(r"^\s*\d+\s*Hz_?\s*", re.IGNORECASE)
-TRAILING_CYCLE_RE = re.compile(r"_\d+$")
-
 
 def parse_swv_bin_file(filepath):
     """Reads a CHI .bin save file directly. Returns (frequency_hz,
@@ -307,27 +308,26 @@ def fill_next_row(label, freq_data, freq_names):
 
 
 # ------------------------------------------------------------------
-def clean_stage_name(bin_filename):
-    """'10Hz_BlankRegen2_3.bin' -> 'BlankRegen2'. Not used for labeling
-    (rows are labeled by reading order + step_minutes, not by concentration)
-    but kept for the console summary / future use."""
-    name = bin_filename
-    if name.lower().endswith(".bin"):
-        name = name[:-4]
-    while True:
-        stripped = HZ_PREFIX_RE.sub("", name, count=1)
-        if stripped == name:
-            break
-        name = stripped
-    return TRAILING_CYCLE_RE.sub("", name.strip()).strip()
+CYCLE_NUMBER_RE = re.compile(r"_(\d+)$")
+
+
+def extract_cycle_number(fname):
+    """'10hz_blank_5.bin' -> 5. CHI doesn't suffix the very first save of a
+    given name -- only repeats get _2, _3, ... -- so a filename with no
+    trailing _N is treated as cycle 1."""
+    stem = fname[:-4] if fname.lower().endswith(".bin") else fname
+    m = CYCLE_NUMBER_RE.search(stem)
+    return int(m.group(1)) if m else 1
 
 
 def run_bin_folder(folder, step_minutes, first_label):
-    """Reads every .bin in folder, groups same-cycle 10Hz/60Hz saves by
-    save time (NOT by filename counter, since CHI doesn't guarantee that's
-    chronological), and writes one row per cycle: the first cycle labeled
-    first_label, each one after in step_minutes increments."""
-    entries = []
+    """Reads every .bin in folder and pairs same-cycle 10Hz/60Hz saves by
+    the number CHI appends to the filename (see extract_cycle_number) --
+    NOT by file timestamp, which can get scrambled by moving/reorganizing
+    files or OneDrive sync. Writes one row per cycle number, in ascending
+    order: the first cycle labeled first_label, each one after in
+    step_minutes increments."""
+    groups = {}  # cycle_number -> {"freq_data": {...}, "freq_names": {...}}
     for fname in sorted(os.listdir(folder)):
         if not fname.lower().endswith(".bin"):
             continue
@@ -340,30 +340,18 @@ def run_bin_folder(folder, step_minutes, first_label):
         if freq not in FREQUENCIES:
             print(f"[!] {fname}: {freq}Hz isn't in FREQUENCIES ({FREQUENCIES}) -- ignored.")
             continue
-        entries.append({
-            "fname": fname, "freq": freq, "ip": ip_values,
-            "ctime": os.path.getctime(fpath),
-        })
-    entries.sort(key=lambda e: e["ctime"])
-
-    groups = []
-    current = None
-    for e in entries:
-        if current is not None:
-            gap = e["ctime"] - current["last_time"]
-            if e["freq"] in current["freq_data"] or gap > GROUP_GAP_SECONDS:
-                groups.append(current)
-                current = None
-        if current is None:
-            current = {"freq_data": {}, "freq_names": {}, "last_time": e["ctime"]}
-        current["freq_data"][e["freq"]] = e["ip"]
-        current["freq_names"][e["freq"]] = e["fname"]
-        current["last_time"] = e["ctime"]
-    if current is not None:
-        groups.append(current)
+        cycle_num = extract_cycle_number(fname)
+        g = groups.setdefault(cycle_num, {"freq_data": {}, "freq_names": {}})
+        if freq in g["freq_data"]:
+            print(f"[!] {fname}: another {freq}Hz file already claimed cycle number {cycle_num} "
+                  f"({g['freq_names'][freq]}) -- keeping that one, skipping this one.")
+            continue
+        g["freq_data"][freq] = ip_values
+        g["freq_names"][freq] = fname
 
     written = 0
-    for g in groups:
+    for cycle_num in sorted(groups):
+        g = groups[cycle_num]
         if not any(g["freq_data"].values()):
             names_str = ", ".join(f"{f}Hz: {n}" for f, n in g["freq_names"].items())
             print(f"Skipped empty run (no data) -- {names_str}")
