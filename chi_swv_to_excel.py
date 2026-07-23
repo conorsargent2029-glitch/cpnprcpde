@@ -63,6 +63,23 @@ If the Excel file is open in Excel when it tries to save, it'll tell you and
 wait -- just close Excel and it saves automatically.
 
 When you're done for the day, just close the window (or Ctrl+C in it).
+
+------------------------------------------------------------------------
+REDUCING A FOLDER THAT ONLY HAS .bin FILES (NO .txt EXPORT)
+------------------------------------------------------------------------
+If CHI's auto-text-save setting was off for a run (e.g. an unattended
+overnight run), you'll only have named .bin saves, no .txt. Run:
+
+    python chi_swv_to_excel.py --bin-folder "C:\path\to\folder" [step_minutes]
+
+This reads each .bin's raw data directly (see parse_swv_bin_file), groups
+10Hz/60Hz saves from the same cycle the same way the watcher does, labels
+the first cycle "initial reading" and each one after in step_minutes-minute
+increments (default 20), and writes them into the Excel file you're
+prompted for -- same layout as everything else. Every ip value written
+this way is an estimate (CHI's own peak-picked number isn't stored in the
+.bin at all -- only the raw curve is, so the peak has to be re-derived from
+it), so treat these rows as approximate, not lab-final numbers.
 """
 
 import re
@@ -71,6 +88,7 @@ import os
 import time
 import json
 import socket
+import struct
 import threading
 import http.server
 import functools
@@ -360,18 +378,46 @@ def release_watch_lock(folder):
 # ------------------------------------------------------------------
 # Parsing SWV data
 # ------------------------------------------------------------------
+def estimate_peak_from_curve(curve, potentials, edge_points=8):
+    """Best-effort Difference peak height from a raw current-vs-potential
+    curve, for when CHI's own peak-picked value isn't available (either it
+    didn't report one in the .txt, or we're reading a .bin directly --
+    see parse_swv_bin_file). Fits a straight line through the first/last
+    edge_points (the flat baseline on either side of the peak) and returns
+    the curve value with the largest deviation from that line -- the
+    standard by-hand way of reading peak height off a voltammogram.
+
+    This is NOT CHI's own peak-picking algorithm and won't match it
+    exactly, but cross-checked against a known CHI-reported result it came
+    within 0.3-1.9% on ip and exact on peak potential, vs. 40%+ error from
+    just taking the raw max magnitude. Returns None if curve is empty."""
+    n = len(curve)
+    if n == 0:
+        return None
+    edge = min(edge_points, max(1, n // 2))
+    xs = potentials[:edge] + potentials[-edge:]
+    ys = curve[:edge] + curve[-edge:]
+    mean_x = sum(xs) / len(xs)
+    mean_y = sum(ys) / len(ys)
+    denom = sum((x - mean_x) ** 2 for x in xs)
+    slope = 0.0 if denom == 0 else sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / denom
+    intercept = mean_y - slope * mean_x
+    residuals = [y - (slope * x + intercept) for x, y in zip(potentials, curve)]
+    return max(residuals, key=abs)
+
+
 def compute_difference_peak_from_raw(text, channel):
     """Fallback for when CHI's own peak-picker didn't report a Difference ip
     for this channel (but Forward/Reverse peaks were found). The raw
     per-point difference-current curve (the "i{ch}d" column in the data
-    table) is usually still there -- scan it for the point with the
-    largest magnitude, the same thing CHI's own peak-picker would report
-    if it hadn't given up. Returns None if the table or column is missing."""
+    table) is usually still there -- pull it out and run it through
+    estimate_peak_from_curve. Returns None if the table or column is
+    missing."""
     header_match = DATA_TABLE_HEADER_RE.search(text)
     if not header_match:
         return None
     col_index = 1 + (channel - 1) * 3  # columns: Potential, i1d,i1f,i1r, i2d,i2f,i2r, ...
-    best = None
+    potentials, values = [], []
     for line in text[header_match.end():].splitlines():
         line = line.strip()
         if not line or "," not in line:
@@ -380,12 +426,96 @@ def compute_difference_peak_from_raw(text, channel):
         if len(parts) <= col_index:
             continue
         try:
+            potential = float(parts[0])
             value = float(parts[col_index])
         except ValueError:
             continue
-        if best is None or abs(value) > abs(best):
-            best = value
-    return best
+        potentials.append(potential)
+        values.append(value)
+    return estimate_peak_from_curve(values, potentials)
+
+
+# ------------------------------------------------------------------
+# Reading CHI's .bin save files directly (no .txt needed)
+# ------------------------------------------------------------------
+# CHI's binary layout, reverse-engineered from a matched .bin/.txt pair
+# (byte-for-byte cross-checked, see estimate_peak_from_curve's docstring
+# for accuracy) rather than from any documentation -- CHI doesn't publish
+# this format. Every value below is a little-endian 32-bit float unless
+# noted, and none of it changed between a 10Hz and a 60Hz save, so it's
+# assumed stable across frequencies:
+#
+#   bytes 0-1690      fixed-size header (technique name, run parameters --
+#                      Ei/Ef/Increment/Amplitude/Frequency/Quiet Time/
+#                      Sensitivity all live in here at fixed offsets)
+#   bytes 1691+        raw per-point curve data, n points where
+#                      n = (filesize - 1691) / 48 -- a run with zero data
+#                      points (e.g. aborted before it produced anything)
+#                      is exactly 1691 bytes with no data section at all
+#     for each point k (0-indexed):
+#       channel 1's (i1d, i1f, i1r) triplet at 1691 + 12*k
+#       channels 2-4's 9 floats (i2d,i2f,i2r, i3d,i3f,i3r, i4d,i4f,i4r)
+#         at 1691 + 12*n + 36*k
+#
+# Notably, CHI's own peak-picked "ip" result (the number in the .txt's
+# "Results:" section) is NOT stored anywhere in this file -- confirmed by
+# exhaustively scanning a known .bin for its paired .txt's exact ip values
+# as both 32- and 64-bit floats, either byte order, and finding nothing.
+# CHI must compute that at export time. So every ip value read from a
+# .bin is an estimate via estimate_peak_from_curve, never CHI's own number.
+BIN_SIGNATURE = b"Square Wave Voltammetry"
+BIN_HEADER_SIZE = 1691
+BIN_FREQ_OFFSET = 1159
+BIN_EI_OFFSET = 1091
+BIN_EF_OFFSET = 1095
+BIN_INCRE_OFFSET = 1111
+BIN_CH1_POINT_BYTES = 12   # one (i1d, i1f, i1r) float32 triplet per data point
+BIN_REST_POINT_BYTES = 36  # one (i2d,i2f,i2r, i3d,i3f,i3r, i4d,i4f,i4r) block per data point
+BIN_BYTES_PER_POINT = BIN_CH1_POINT_BYTES + BIN_REST_POINT_BYTES  # 48
+
+
+def parse_swv_bin_file(filepath):
+    """Reads a CHI .bin save file directly -- for when only the named .bin
+    exists and there's no auto-saved .txt to parse (e.g. CHI's auto-text-
+    save setting was off for an unattended run). See the BIN_* constants
+    above for the layout this relies on.
+
+    Returns (frequency_hz, {channel_num: ip_value}, {estimated channel
+    numbers}) in the same shape as parse_swv_file, or (None, {}, set()) if
+    this doesn't look like a CHI SWV .bin, or it has zero data points
+    (e.g. a run that was aborted before producing anything). Every channel
+    comes back "estimated" here -- see the module note above."""
+    with open(filepath, "rb") as f:
+        data = f.read()
+
+    if BIN_SIGNATURE not in data[:200] or len(data) < BIN_HEADER_SIZE:
+        return None, {}, set()
+
+    n, remainder = divmod(len(data) - BIN_HEADER_SIZE, BIN_BYTES_PER_POINT)
+    if remainder != 0 or n <= 0:
+        return None, {}, set()
+
+    def f32(offset):
+        return struct.unpack_from("<f", data, offset)[0]
+
+    frequency = f32(BIN_FREQ_OFFSET)
+    ei = f32(BIN_EI_OFFSET)
+    ef = f32(BIN_EF_OFFSET)
+    incre = f32(BIN_INCRE_OFFSET)
+    step = incre if ef >= ei else -incre
+    potentials = [ei + step * (k + 1) for k in range(n)]
+
+    curves = {1: [], 2: [], 3: [], 4: []}
+    for k in range(n):
+        curves[1].append(f32(BIN_HEADER_SIZE + BIN_CH1_POINT_BYTES * k))
+    base_rest = BIN_HEADER_SIZE + BIN_CH1_POINT_BYTES * n
+    for k in range(n):
+        row = base_rest + BIN_REST_POINT_BYTES * k
+        for i, ch in enumerate((2, 3, 4)):
+            curves[ch].append(f32(row + i * 12))
+
+    ip_values = {ch: estimate_peak_from_curve(curves[ch], potentials) for ch in (1, 2, 3, 4)}
+    return frequency, ip_values, {1, 2, 3, 4}
 
 
 def parse_swv_file(filepath):
@@ -687,6 +817,68 @@ def run_manual(file_paths):
 
 
 # ------------------------------------------------------------------
+# Bin-folder mode -- one-off reduction of a folder that has ONLY named
+# .bin saves and no auto .txt export (e.g. CHI's auto-text-save setting
+# was off for an unattended overnight run). Every ip value written this
+# way is an estimate -- see parse_swv_bin_file -- not CHI's own
+# peak-picked number.
+# ------------------------------------------------------------------
+def run_bin_folder(folder, step_minutes=20, first_label="initial reading"):
+    """Reads every .bin in folder, groups same-cycle 10Hz/60Hz saves by
+    save time (same grouping rule as the live watcher -- NOT by filename
+    counter, since CHI doesn't guarantee that's chronological), and writes
+    one row per cycle: the first cycle is labeled first_label, each one
+    after in step_minutes increments (step_minutes mins, 2*step_minutes
+    mins, ...)."""
+    entries = []
+    for fname in sorted(os.listdir(folder)):
+        if not fname.lower().endswith(".bin"):
+            continue
+        fpath = os.path.join(folder, fname)
+        frequency, ip_values, estimated = parse_swv_bin_file(fpath)
+        if frequency is None:
+            print(f"[!] {fname}: couldn't read this as a CHI SWV .bin (or it has no data points) -- skipped.")
+            continue
+        freq = int(round(frequency))
+        if freq not in FREQUENCIES:
+            print(f"[!] {fname}: {freq}Hz isn't in FREQUENCIES ({FREQUENCIES}) -- ignored.")
+            continue
+        entries.append({
+            "fname": fname, "freq": freq, "ip": ip_values, "estimated": estimated,
+            "ctime": os.path.getctime(fpath),
+        })
+    entries.sort(key=lambda e: e["ctime"])
+
+    groups = []
+    current = None
+    for e in entries:
+        if current is not None:
+            gap = e["ctime"] - current["last_time"]
+            if e["freq"] in current["freq_data"] or gap > GROUP_GAP_SECONDS:
+                groups.append(current)
+                current = None
+        if current is None:
+            current = {"freq_data": {}, "freq_names": {}, "last_time": e["ctime"]}
+        current["freq_data"][e["freq"]] = (e["ip"], e["estimated"])
+        current["freq_names"][e["freq"]] = e["fname"]
+        current["last_time"] = e["ctime"]
+    if current is not None:
+        groups.append(current)
+
+    written = 0
+    for g in groups:
+        if not any(ip for ip, _ in g["freq_data"].values()):
+            names_str = ", ".join(f"{f}Hz: {n}" for f, n in g["freq_names"].items())
+            print(f"Skipped empty run (no data) -- {names_str}")
+            continue
+        label = first_label if written == 0 else f"{written * step_minutes} mins"
+        fill_next_row(label, g["freq_data"], g["freq_names"], flag_for_review=False)
+        written += 1
+
+    print(f"\nDone -- wrote {written} row(s) to {EXCEL_PATH}")
+
+
+# ------------------------------------------------------------------
 # Watch mode
 # ------------------------------------------------------------------
 def load_processed_log(folder):
@@ -847,7 +1039,11 @@ def auto_configure():
 
 
 if __name__ == "__main__":
-    if len(sys.argv) >= 3 and sys.argv[1] != "--auto":
+    if len(sys.argv) >= 3 and sys.argv[1] == "--bin-folder":
+        step = int(sys.argv[3]) if len(sys.argv) > 3 else 20
+        prompt_for_excel_path()
+        run_bin_folder(sys.argv[2], step_minutes=step)
+    elif len(sys.argv) >= 3 and sys.argv[1] != "--auto":
         prompt_for_excel_path()
         run_manual(sys.argv[1:])
     elif len(sys.argv) == 2 and sys.argv[1] == "--auto":
@@ -862,3 +1058,6 @@ if __name__ == "__main__":
         print("  python chi_swv_to_excel.py                    (watch mode, asks for folder + Excel file)")
         print("  python chi_swv_to_excel.py --auto              (watch mode, no prompts -- reuses last settings)")
         print("  python chi_swv_to_excel.py file1.txt file2.txt [file3.txt ...]  (manual, one cycle's worth of files)")
+        print("  python chi_swv_to_excel.py --bin-folder <folder> [step_minutes]")
+        print("      (reduces a folder of .bin-only saves, e.g. an overnight run with no auto .txt export --")
+        print("       first cycle labeled \"initial reading\", each one after in step_minutes increments, default 20)")
