@@ -34,7 +34,7 @@ checks for new .txt files every few seconds, and as each one appears it:
           "60 Hz - Agarose Gel Sensor", "60 Hz - Normal Sensor"
   5. Labels rows in fixed 20-minute increments: "initial reading", then
      "20 mins", "40 mins", ... Rows are placed in that order using the
-     cycle number CHI appends to the filename (e.g. "10hz_..._13.txt" =
+     cycle number CHI appends to the filename (e.g. "60hz_sweat_13.txt" =
      cycle 13) -- NOT file timestamps, which can get scrambled by copying
      files around or OneDrive sync reordering things after the fact.
 
@@ -45,6 +45,20 @@ checks for new .txt files every few seconds, and as each one appears it:
      cycle -- meaning that frequency's file for this cycle isn't coming
      (e.g. the macro skipped it), so the row is written with that block
      left blank rather than waiting forever.
+  6. Detects when you change the save label mid-run -- e.g. spiking the
+     sample partway through, "sweat" -> "sweat 5nM" -- the same way the
+     filename encodes a stage change (frequency prefix and trailing cycle
+     number stripped, whatever's left is the stage: "60hz_sweat_13.txt" is
+     stage "sweat" cycle 13; "60Hz_sweat 5nM_1.txt" is stage "sweat 5nM"
+     cycle 1 -- note CHI restarts the _N counter from 1 for each distinct
+     label, so cycle numbers are only unique WITHIN a stage, not across
+     the whole run). The row where the stage first changes gets the new
+     stage name as its label instead of "N mins" (e.g. "sweat 5nM"), and
+     is highlighted gold in Excel so the spike point is easy to spot at a
+     glance. Every row after that goes back to counting "N mins" from that
+     point. All of a stage's cycles are written out (in ascending
+     cycle-number order) before any row from the next stage, regardless of
+     which order the underlying files happened to arrive in.
 
 EXPECTED FILE FORMAT
 ---------------------
@@ -75,17 +89,32 @@ run:
     python chi_8ch_watcher.py
 
 It will ask for the folder to watch and the Excel file to write to, then
-run continuously -- checking for new .txt files every POLL_SECONDS -- until
-you close the window (Ctrl+C).
+run continuously -- checking for new .txt/.bin files every POLL_SECONDS --
+until you close the window (Ctrl+C).
+
+READING .bin FILES DIRECTLY (no .txt export)
+---------------------------------------------
+If a stage is missing its .txt export (e.g. CHI's auto-text-save setting
+was off), this watcher also reads the named .bin save directly -- same
+approach as chi_bin_to_excel.py: CHI's binary format doesn't store its own
+peak-picked ip, only the raw curve, so every channel from a .bin is always
+an estimate (marked italic, like any other estimated channel here).
+
+IMPORTANT: the byte layout used to decode a .bin (see the BIN_* constants)
+was reverse-engineered from a 4-channel file and is EXTRAPOLATED to 8
+channels by assuming the same per-channel pattern continues -- it has NOT
+been verified against a real 8-channel .bin. If the numbers coming out of
+a .bin look implausible, that extrapolation is the first thing to check.
 """
 
 import os
 import re
+import struct
 import sys
 import time
 
 from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Font
+from openpyxl.styles import Font, PatternFill
 
 # ----------------------- CONFIG -----------------------
 EXCEL_DIR = r"C:\Users\gao22\Documents"
@@ -268,6 +297,80 @@ def parse_swv_txt_file(filepath):
 
 
 # ------------------------------------------------------------------
+# Reading CHI's .bin save files directly (no .txt export available)
+# ------------------------------------------------------------------
+# Layout reverse-engineered from a matched 4-channel .bin/.txt pair (see
+# chi_bin_to_excel.py's docstring for how). EXTRAPOLATED here to 8 channels
+# by assuming the pattern continues: channel 1 gets its own dedicated block
+# of (d,f,r) triplets, then every other channel follows in the same
+# row-major layout, one (d,f,r) triplet per channel per data point. This
+# has NOT been verified against a real 8-channel .bin -- see the module
+# docstring. Every value is a little-endian 32-bit float.
+#
+#   bytes 0-1690     fixed-size header (Ei/Ef/Increment/Frequency/etc at
+#                     fixed offsets below) -- assumed identical regardless
+#                     of channel count, since it's unrelated to how many
+#                     channels are wired up.
+#   bytes 1691+       raw per-point curve data, n points where
+#                     n = (filesize - 1691) / (12 * channel_count)
+#     for each point k (0-indexed):
+#       channel 1's (d, f, r) triplet at 1691 + 12*k
+#       every other channel's (d, f, r) triplet, in channel order, at
+#         1691 + 12*n + 12*(channel_count-1)*k + 12*(position in that list)
+BIN_SIGNATURE = b"Square Wave Voltammetry"
+BIN_HEADER_SIZE = 1691
+BIN_FREQ_OFFSET = 1159
+BIN_EI_OFFSET = 1091
+BIN_EF_OFFSET = 1095
+BIN_INCRE_OFFSET = 1111
+
+
+def parse_swv_bin_file(filepath):
+    """Reads a CHI .bin save file directly. Returns (frequency_hz,
+    {channel_num: ip_value}, {estimated channel numbers}) in the same shape
+    as parse_swv_txt_file, or (None, {}, set()) if this doesn't look like a
+    CHI SWV .bin, or it has zero data points (e.g. an aborted run). Every
+    channel comes back estimated -- CHI's own peak-picked ip isn't stored
+    in the .bin at all, only the raw curve (see chi_bin_to_excel.py's
+    docstring for how that was confirmed)."""
+    with open(filepath, "rb") as f:
+        data = f.read()
+
+    if BIN_SIGNATURE not in data[:200] or len(data) < BIN_HEADER_SIZE:
+        return None, {}, set()
+
+    num_channels = len(ALL_CHANNELS)
+    bytes_per_point = 12 * num_channels
+    n, remainder = divmod(len(data) - BIN_HEADER_SIZE, bytes_per_point)
+    if remainder != 0 or n <= 0:
+        return None, {}, set()
+
+    def f32(offset):
+        return struct.unpack_from("<f", data, offset)[0]
+
+    frequency = f32(BIN_FREQ_OFFSET)
+    ei = f32(BIN_EI_OFFSET)
+    ef = f32(BIN_EF_OFFSET)
+    incre = f32(BIN_INCRE_OFFSET)
+    step = incre if ef >= ei else -incre
+    potentials = [ei + step * (k + 1) for k in range(n)]
+
+    curves = {ch: [] for ch in ALL_CHANNELS}
+    for k in range(n):
+        curves[ALL_CHANNELS[0]].append(f32(BIN_HEADER_SIZE + 12 * k))
+    rest_channels = ALL_CHANNELS[1:]
+    base_rest = BIN_HEADER_SIZE + 12 * n
+    rest_stride = 12 * len(rest_channels)
+    for k in range(n):
+        row = base_rest + rest_stride * k
+        for i, ch in enumerate(rest_channels):
+            curves[ch].append(f32(row + i * 12))
+
+    ip_values = {ch: estimate_peak_from_curve(curves[ch], potentials) for ch in ALL_CHANNELS}
+    return frequency, ip_values, set(ALL_CHANNELS)
+
+
+# ------------------------------------------------------------------
 # Excel template -- one block per (frequency, sensor type) combination,
 # in FREQUENCIES x SENSOR_GROUPS order, left to right.
 # ------------------------------------------------------------------
@@ -311,10 +414,12 @@ def write_ip_row(ws, row, col_start, ip_values, estimated_channels, channels):
             cell.font = ESTIMATED_FONT
 
 
-def fill_next_row(label, freq_data):
+def fill_next_row(label, freq_data, spike=False):
     """freq_data: {freq: (ip_values_dict, estimated_channels_set)} -- a
     frequency missing from this dict leaves both of that frequency's
-    blocks blank for this row."""
+    blocks blank for this row. spike=True highlights the row's Run cells
+    gold -- used for the first row of a new stage (see extract_stage_and_cycle),
+    e.g. the point a sample was spiked."""
     if os.path.exists(EXCEL_PATH):
         wb = load_workbook(EXCEL_PATH)
         ws = wb["8Ch Data"] if "8Ch Data" in wb.sheetnames else wb.active
@@ -325,7 +430,9 @@ def fill_next_row(label, freq_data):
     row = find_next_empty_row(ws)
     for i, (freq, sensor_name, channels) in enumerate(BLOCKS):
         col = block_start_col(i)
-        ws.cell(row=row, column=col, value=label)
+        label_cell = ws.cell(row=row, column=col, value=label)
+        if spike:
+            label_cell.fill = SPIKE_FILL
         ip_values, estimated_channels = freq_data.get(freq) or ({}, set())
         write_ip_row(ws, row, col_start=col + 1, ip_values=ip_values,
                      estimated_channels=estimated_channels, channels=channels)
@@ -345,74 +452,131 @@ def fill_next_row(label, freq_data):
     have = ", ".join(f"{freq}Hz" for freq in FREQUENCIES if (freq_data.get(freq) or ({}, None))[0])
     missing = ", ".join(f"{freq}Hz" for freq in FREQUENCIES if not (freq_data.get(freq) or ({}, None))[0])
     note = f"  [missing: {missing}]" if missing else ""
-    print(f'Filled row {row} ("{label}") -- have: {have or "(none)"}{note}')
+    spike_note = "  [SPIKE POINT]" if spike else ""
+    print(f'Filled row {row} ("{label}") -- have: {have or "(none)"}{note}{spike_note}')
 
 
 # ------------------------------------------------------------------
+HZ_PREFIX_RE = re.compile(r"^\s*\d+\s*hz_?\s*", re.IGNORECASE)
 CYCLE_NUMBER_RE = re.compile(r"_(\d+)$")
 
+SPIKE_FILL = PatternFill(start_color="FFC000", end_color="FFC000", fill_type="solid")
 
-def extract_cycle_number(fname):
-    """'10hz_exercise_sweat_13.txt' -> 13. No trailing _N means cycle 1
-    (CHI doesn't suffix the very first save of a given name)."""
+
+def extract_stage_and_cycle(fname):
+    """'60hz_sweat_13.txt' -> ('sweat', 13). '60Hz_sweat 5nM_1.txt' ->
+    ('sweat 5nM', 1). No trailing _N means cycle 1 (CHI doesn't suffix the
+    very first save of a given name). Cycle numbers are only unique WITHIN
+    a stage -- CHI restarts the _N counter from 1 every time the save label
+    itself changes -- so callers must key on (stage, cycle), never cycle
+    alone."""
     stem = fname[:-4] if fname.lower().endswith(".txt") else fname
+    stem = HZ_PREFIX_RE.sub("", stem, count=1)
     m = CYCLE_NUMBER_RE.search(stem)
-    return int(m.group(1)) if m else 1
-
-
-def label_for_index(index):
-    """index 0 -> 'initial reading', index 1 -> '20 mins', index 2 ->
-    '40 mins', ... continues past 1440 mins (24h) if more files show up."""
-    if index == 0:
-        return FIRST_LABEL
-    return f"{index * STEP_MINUTES} mins"
+    if m:
+        return stem[:m.start()].strip(), int(m.group(1))
+    return stem.strip(), 1
 
 
 def watch_folder(folder):
-    """Polls folder every POLL_SECONDS for new .txt files. Keeps only files
-    at a frequency in FREQUENCIES (anything else is skipped and never
-    written). New files are queued up per cycle number, per frequency, and
-    written out in ascending cycle-number order -- but NOT assuming cycle
-    numbers are small consecutive integers starting near 1: CHI's per-name
-    counter carries over from however many times that save name has ever
-    been used before (we've seen it start in the thousands), so this always
-    processes the SMALLEST cycle number actually present in pending, not
-    "whatever number comes right after the last one written." A cycle is
-    "settled" and gets flushed once it's either got both frequencies, or a
-    LATER cycle number has shown up for a frequency still missing it (see
-    the module docstring's point 5) -- so a gap in the real numbering never
-    produces a fake blank row, only a genuinely skipped file does."""
-    seen = set()
-    pending = {}  # cycle_number -> {freq: (ip_values, estimated_channels)}, for cycles not yet written
-    max_seen_cycle = {freq: 0 for freq in FREQUENCIES}  # how far each frequency's stream has gotten
-    written_count = 0  # how many rows have been written so far -- drives the mins label, NOT the cycle number
+    """Polls folder every POLL_SECONDS for new .txt/.bin files. Keeps only
+    files at a frequency in FREQUENCIES (anything else is skipped and never
+    written). Files are grouped by (stage, cycle_number) -- see
+    extract_stage_and_cycle -- and written out stage by stage, ascending
+    cycle number within a stage. A cycle is "settled" and gets flushed once
+    it's either got both frequencies, or a LATER cycle in the SAME stage
+    (or any cycle in a chronologically LATER stage) has shown up for a
+    frequency still missing it here -- meaning that frequency's file for
+    this cycle isn't coming, so the row is written with that block left
+    blank rather than waiting forever. The first row of a stage after the
+    very first one overall is labeled with the stage name itself and
+    highlighted gold (see fill_next_row) -- this is what marks a
+    spike/relabel partway through the run.
 
-    print(f"Watching {folder} for new .txt files ({'/'.join(str(f) for f in FREQUENCIES)} Hz only)... Ctrl+C to stop.\n")
+    Stages are ordered by each stage's EARLIEST file creation time, not by
+    the order os.listdir() happens to return them in -- directory order is
+    alphabetical, and e.g. "10Hz_sweat 5nM_1.txt" sorts before
+    "10hz_sweat.txt" (capital H < lowercase h), which would register the
+    spike stage as if it came first. Creation time is trustworthy here
+    specifically because this is a live folder being watched as CHI writes
+    to it, not a folder that was reorganized/copied after the fact (that's
+    the scenario chi_bin_to_excel.py had to stop trusting timestamps for)."""
+    seen = set()
+    pending = {}            # stage -> {cycle_num: {freq: (ip_values, estimated_channels)}}
+    max_seen_cycle = {}     # stage -> {freq: highest cycle number seen for that stage+freq}
+    stage_first_ctime = {}  # stage -> earliest file creation time seen for that stage
+    freq_latest_stage = {freq: None for freq in FREQUENCIES}  # each freq's chronologically furthest-along stage
+    state = {"current_stage": None, "stage_written_count": 0, "any_written": False}
+
+    print(f"Watching {folder} for new files ({'/'.join(str(f) for f in FREQUENCIES)} Hz only)... Ctrl+C to stop.\n")
+
+    def stage_order():
+        return sorted(stage_first_ctime, key=stage_first_ctime.get)
 
     def try_flush():
-        nonlocal written_count
-        while pending:
-            cycle_num = min(pending)
-            entry = pending[cycle_num]
-            ready = all(freq in entry or max_seen_cycle[freq] > cycle_num for freq in FREQUENCIES)
-            if not ready:
+        order = stage_order()
+        if state["current_stage"] is None:
+            if not order:
                 return
-            pending.pop(cycle_num, None)
-            label = label_for_index(written_count)
-            fill_next_row(label, entry)
-            written_count += 1
+            state["current_stage"] = order[0]
+
+        while True:
+            stage = state["current_stage"]
+            stage_pending = pending.get(stage, {})
+            if not stage_pending:
+                # Nothing queued for this stage right now. Only safe to move on
+                # once a chronologically LATER stage is already known to exist --
+                # otherwise this might just be the current stage still in progress.
+                order = stage_order()
+                idx = order.index(stage)
+                if idx + 1 < len(order):
+                    state["current_stage"] = order[idx + 1]
+                    state["stage_written_count"] = 0
+                    continue
+                return
+
+            cycle_num = min(stage_pending)
+            entry = stage_pending[cycle_num]
+
+            def freq_settled(freq):
+                if freq in entry:
+                    return True
+                if max_seen_cycle.get(stage, {}).get(freq, 0) > cycle_num:
+                    return True
+                latest = freq_latest_stage[freq]
+                return latest is not None and stage_first_ctime[latest] > stage_first_ctime[stage]
+
+            if not all(freq_settled(freq) for freq in FREQUENCIES):
+                return
+
+            del stage_pending[cycle_num]
+            if not state["any_written"]:
+                label, spike = FIRST_LABEL, False
+            elif state["stage_written_count"] == 0:
+                label, spike = stage, True
+            else:
+                label, spike = f"{state['stage_written_count'] * STEP_MINUTES} mins", False
+            fill_next_row(label, entry, spike=spike)
+            state["any_written"] = True
+            state["stage_written_count"] += 1
 
     while True:
         try:
             for fname in sorted(os.listdir(folder)):
-                if not fname.lower().endswith(".txt") or fname in seen:
+                lower = fname.lower()
+                is_txt = lower.endswith(".txt")
+                is_bin = lower.endswith(".bin")
+                if not (is_txt or is_bin) or fname in seen:
                     continue
                 seen.add(fname)
                 fpath = os.path.join(folder, fname)
 
-                frequency, ip_values, estimated = parse_swv_txt_file(fpath)
+                if is_txt:
+                    frequency, ip_values, estimated = parse_swv_txt_file(fpath)
+                else:
+                    frequency, ip_values, estimated = parse_swv_bin_file(fpath)
                 if frequency is None:
-                    print(f"[!] {fname}: couldn't read as a CHI SWV .txt (or no Results found) -- skipped.")
+                    print(f"[!] {fname}: couldn't read this as a CHI SWV file (or it has no data) -- skipped.")
                     continue
 
                 freq_rounded = int(round(frequency))
@@ -420,17 +584,28 @@ def watch_folder(folder):
                     print(f"[-] {fname}: {freq_rounded} Hz (not in {FREQUENCIES}) -- ignored.")
                     continue
 
-                cycle_num = extract_cycle_number(fname)
-                entry = pending.setdefault(cycle_num, {})
+                stage, cycle_num = extract_stage_and_cycle(fname)
+                try:
+                    ctime = os.path.getctime(fpath)
+                except OSError:
+                    ctime = time.time()
+                if stage not in stage_first_ctime or ctime < stage_first_ctime[stage]:
+                    stage_first_ctime[stage] = ctime
+                latest = freq_latest_stage[freq_rounded]
+                if latest is None or stage_first_ctime[stage] > stage_first_ctime[latest]:
+                    freq_latest_stage[freq_rounded] = stage
+
+                entry = pending.setdefault(stage, {}).setdefault(cycle_num, {})
                 if freq_rounded in entry:
-                    print(f"[!] {fname}: {freq_rounded}Hz cycle {cycle_num} already queued -- keeping the first one seen, skipping this.")
+                    print(f"[!] {fname}: {freq_rounded}Hz stage \"{stage}\" cycle {cycle_num} already queued -- keeping the first one seen, skipping this.")
                     continue
                 entry[freq_rounded] = (ip_values, estimated)
-                max_seen_cycle[freq_rounded] = max(max_seen_cycle[freq_rounded], cycle_num)
+                max_seen_cycle.setdefault(stage, {})[freq_rounded] = max(
+                    max_seen_cycle.setdefault(stage, {}).get(freq_rounded, 0), cycle_num)
                 still_missing = [ch for ch in ALL_CHANNELS if ch not in ip_values]
                 est_note = f" (estimated Ch{sorted(estimated)})" if estimated else ""
                 miss_note = f" (missing Ch{still_missing})" if still_missing else ""
-                print(f"[+] {fname}: {freq_rounded}Hz, cycle {cycle_num} -- queued{est_note}{miss_note}.")
+                print(f"[+] {fname}: {freq_rounded}Hz, stage \"{stage}\" cycle {cycle_num} -- queued{est_note}{miss_note}.")
 
             try_flush()
             time.sleep(POLL_SECONDS)
