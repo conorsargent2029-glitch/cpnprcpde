@@ -100,11 +100,12 @@ approach as chi_bin_to_excel.py: CHI's binary format doesn't store its own
 peak-picked ip, only the raw curve, so every channel from a .bin is always
 an estimate (marked italic, like any other estimated channel here).
 
-IMPORTANT: the byte layout used to decode a .bin (see the BIN_* constants)
-was reverse-engineered from a 4-channel file and is EXTRAPOLATED to 8
-channels by assuming the same per-channel pattern continues -- it has NOT
-been verified against a real 8-channel .bin. If the numbers coming out of
-a .bin look implausible, that extrapolation is the first thing to check.
+The byte layout used to decode a .bin (see the BIN_* constants) was
+reverse-engineered from a 4-channel file and extrapolated to 8 channels by
+assuming the same per-channel pattern continues -- confirmed against 5 real
+8-channel .bin files: the header decodes to sane parameters, the point
+count computed purely from file size matches (Ef-Ei)/Increment exactly,
+and the decoded channel curves are smooth with no NaN/garbage values.
 """
 
 import os
@@ -300,11 +301,11 @@ def parse_swv_txt_file(filepath):
 # Reading CHI's .bin save files directly (no .txt export available)
 # ------------------------------------------------------------------
 # Layout reverse-engineered from a matched 4-channel .bin/.txt pair (see
-# chi_bin_to_excel.py's docstring for how). EXTRAPOLATED here to 8 channels
-# by assuming the pattern continues: channel 1 gets its own dedicated block
+# chi_bin_to_excel.py's docstring for how), extrapolated to 8 channels by
+# assuming the pattern continues: channel 1 gets its own dedicated block
 # of (d,f,r) triplets, then every other channel follows in the same
-# row-major layout, one (d,f,r) triplet per channel per data point. This
-# has NOT been verified against a real 8-channel .bin -- see the module
+# row-major layout, one (d,f,r) triplet per channel per data point.
+# Confirmed against 5 real 8-channel .bin files -- see the module
 # docstring. Every value is a little-endian 32-bit float.
 #
 #   bytes 0-1690     fixed-size header (Ei/Ef/Increment/Frequency/etc at
