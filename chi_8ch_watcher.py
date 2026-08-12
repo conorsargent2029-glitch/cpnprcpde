@@ -14,11 +14,14 @@ checks for new .txt files every few seconds, and as each one appears it:
      off; see chi_bin_to_excel.py for that separate situation).
   2. Pulls the real "ip" value straight out of each channel's "Results:"
      section (the Difference ip, e.g. "Channel 5: ... Difference: ...
-     ip = -1.989e-6A"). This is CHI's own computed peak, not an estimate --
-     .txt exports are the one format where that number is actually present
-     as text (chi_bin_to_excel.py's docstring explains that .bin saves do
-     NOT store this value, which is why that script has to estimate it from
-     the raw curve instead).
+     ip = -1.989e-6A"). This is CHI's own computed peak. If a channel has
+     no Difference result at all (CHI's peak-picker gave up on it -- this
+     happens more on a long unattended run than a supervised one), its ip
+     is instead estimated from that channel's raw difference-current curve
+     further down in the same file (same baseline-corrected method
+     chi_swv_to_excel.py and chi_bin_to_excel.py use), rather than left
+     blank -- marked italic in Excel so you can tell it apart from CHI's
+     own number.
   3. Keeps only files at a frequency in FREQUENCIES (10Hz and 60Hz by
      default, checked via the "Frequency (Hz) = " line in the file header).
      Any other frequency is skipped entirely and never written.
@@ -82,6 +85,7 @@ import sys
 import time
 
 from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Font
 
 # ----------------------- CONFIG -----------------------
 EXCEL_DIR = r"C:\Users\gao22\Documents"
@@ -154,6 +158,7 @@ def _save_last_used(key, value):
 # Parsing CHI's plain-text SWV export
 # ------------------------------------------------------------------
 FREQUENCY_RE = re.compile(r"Frequency\s*\(Hz\)\s*=\s*([\d.]+)")
+DATA_TABLE_HEADER_RE = re.compile(r"^Potential/V.*$", re.MULTILINE)
 
 # Matches each "Channel N:" section up through its first "Difference:"
 # block's ip value, e.g.:
@@ -168,23 +173,78 @@ CHANNEL_IP_RE = re.compile(
     r"ip\s*=\s*([-\d.eE]+)A"
 )
 
+ALL_CHANNELS = tuple(ch for _, channels in SENSOR_GROUPS for ch in channels)
+
+
+def estimate_peak_from_curve(curve, potentials, edge_points=8):
+    """Fits a straight-line baseline through the first/last edge_points of
+    the curve, then returns the curve value with the largest deviation
+    from that line -- the standard by-hand way of reading peak height off
+    a voltammogram. Not CHI's own peak-picking algorithm, but cross-checked
+    elsewhere in this project's other scripts it lands within 0.3-1.9% on
+    ip and exact on peak potential. Returns None if curve is empty."""
+    n = len(curve)
+    if n == 0:
+        return None
+    edge = min(edge_points, max(1, n // 2))
+    xs = potentials[:edge] + potentials[-edge:]
+    ys = curve[:edge] + curve[-edge:]
+    mean_x = sum(xs) / len(xs)
+    mean_y = sum(ys) / len(ys)
+    denom = sum((x - mean_x) ** 2 for x in xs)
+    slope = 0.0 if denom == 0 else sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / denom
+    intercept = mean_y - slope * mean_x
+    residuals = [y - (slope * x + intercept) for x, y in zip(potentials, curve)]
+    return max(residuals, key=abs)
+
+
+def compute_difference_peak_from_raw(text, channel):
+    """Fallback for when CHI's own peak-picker didn't report a Difference
+    ip for this channel. The raw per-point difference-current curve (the
+    "i{ch}d" column in the data table) is usually still there -- pull it
+    out and run it through estimate_peak_from_curve. Returns None if the
+    table or column is missing."""
+    header_match = DATA_TABLE_HEADER_RE.search(text)
+    if not header_match:
+        return None
+    col_index = 1 + (channel - 1) * 3  # columns: Potential, i1d,i1f,i1r, i2d,i2f,i2r, ...
+    potentials, values = [], []
+    for line in text[header_match.end():].splitlines():
+        line = line.strip()
+        if not line or "," not in line:
+            continue
+        parts = line.split(",")
+        if len(parts) <= col_index:
+            continue
+        try:
+            potential = float(parts[0])
+            value = float(parts[col_index])
+        except ValueError:
+            continue
+        potentials.append(potential)
+        values.append(value)
+    return estimate_peak_from_curve(values, potentials)
+
 
 def parse_swv_txt_file(filepath):
     """Reads a CHI SWV .txt export. Returns (frequency_hz, {channel_num:
-    ip_value}) using CHI's own computed ip from each channel's Difference
-    section, or (None, {}) if this doesn't look like a CHI SWV text file."""
+    ip_value}, {estimated channel numbers}) -- CHI's own computed ip from
+    each channel's Difference section where available, falling back to
+    compute_difference_peak_from_raw (and marked as estimated) for any
+    channel CHI didn't report one for. Returns (None, {}, set()) if this
+    doesn't look like a CHI SWV text file."""
     try:
         with open(filepath, "r", errors="ignore") as f:
             text = f.read()
     except OSError:
-        return None, {}
+        return None, {}, set()
 
     if "Square Wave Voltammetry" not in text:
-        return None, {}
+        return None, {}, set()
 
     freq_match = FREQUENCY_RE.search(text)
     if not freq_match:
-        return None, {}
+        return None, {}, set()
     frequency = float(freq_match.group(1))
 
     ip_values = {}
@@ -193,10 +253,18 @@ def parse_swv_txt_file(filepath):
         ip_val = float(ch_match.group(2))
         ip_values[ch_num] = ip_val
 
-    if not ip_values:
-        return None, {}
+    estimated = set()
+    for ch in ALL_CHANNELS:
+        if ch not in ip_values:
+            fallback = compute_difference_peak_from_raw(text, ch)
+            if fallback is not None:
+                ip_values[ch] = fallback
+                estimated.add(ch)
 
-    return frequency, ip_values
+    if not ip_values:
+        return None, {}, set()
+
+    return frequency, ip_values, estimated
 
 
 # ------------------------------------------------------------------
@@ -232,18 +300,20 @@ def find_next_empty_row(ws):
     return row
 
 
-def write_ip_row(ws, row, col_start, ip_values, channels):
+ESTIMATED_FONT = Font(italic=True)
+
+
+def write_ip_row(ws, row, col_start, ip_values, estimated_channels, channels):
     for offset, ch in enumerate(channels):
         cell = ws.cell(row=row, column=col_start + offset, value=ip_values.get(ch))
         cell.number_format = NUM_FMT
-        # Note: no "estimated" marker needed here -- unlike chi_bin_to_excel.py,
-        # these ip values come straight from CHI's own Results section, not
-        # from a curve-based estimate.
+        if ch in estimated_channels:
+            cell.font = ESTIMATED_FONT
 
 
 def fill_next_row(label, freq_data):
-    """freq_data: {freq: ip_values_dict} -- a frequency missing from this
-    dict (or with an empty ip_values) leaves both of that frequency's
+    """freq_data: {freq: (ip_values_dict, estimated_channels_set)} -- a
+    frequency missing from this dict leaves both of that frequency's
     blocks blank for this row."""
     if os.path.exists(EXCEL_PATH):
         wb = load_workbook(EXCEL_PATH)
@@ -256,8 +326,9 @@ def fill_next_row(label, freq_data):
     for i, (freq, sensor_name, channels) in enumerate(BLOCKS):
         col = block_start_col(i)
         ws.cell(row=row, column=col, value=label)
-        ip_values = freq_data.get(freq) or {}
-        write_ip_row(ws, row, col_start=col + 1, ip_values=ip_values, channels=channels)
+        ip_values, estimated_channels = freq_data.get(freq) or ({}, set())
+        write_ip_row(ws, row, col_start=col + 1, ip_values=ip_values,
+                     estimated_channels=estimated_channels, channels=channels)
 
     warned = False
     while True:
@@ -271,8 +342,8 @@ def fill_next_row(label, freq_data):
                 warned = True
             time.sleep(3.0)
 
-    have = ", ".join(f"{freq}Hz" for freq in FREQUENCIES if freq_data.get(freq))
-    missing = ", ".join(f"{freq}Hz" for freq in FREQUENCIES if not freq_data.get(freq))
+    have = ", ".join(f"{freq}Hz" for freq in FREQUENCIES if (freq_data.get(freq) or ({}, None))[0])
+    missing = ", ".join(f"{freq}Hz" for freq in FREQUENCIES if not (freq_data.get(freq) or ({}, None))[0])
     note = f"  [missing: {missing}]" if missing else ""
     print(f'Filled row {row} ("{label}") -- have: {have or "(none)"}{note}')
 
@@ -312,7 +383,7 @@ def watch_folder(folder):
     the module docstring's point 5) -- so a gap in the real numbering never
     produces a fake blank row, only a genuinely skipped file does."""
     seen = set()
-    pending = {}  # cycle_number -> {freq: ip_values}, for cycles not yet written
+    pending = {}  # cycle_number -> {freq: (ip_values, estimated_channels)}, for cycles not yet written
     max_seen_cycle = {freq: 0 for freq in FREQUENCIES}  # how far each frequency's stream has gotten
     written_count = 0  # how many rows have been written so far -- drives the mins label, NOT the cycle number
 
@@ -339,7 +410,7 @@ def watch_folder(folder):
                 seen.add(fname)
                 fpath = os.path.join(folder, fname)
 
-                frequency, ip_values = parse_swv_txt_file(fpath)
+                frequency, ip_values, estimated = parse_swv_txt_file(fpath)
                 if frequency is None:
                     print(f"[!] {fname}: couldn't read as a CHI SWV .txt (or no Results found) -- skipped.")
                     continue
@@ -354,11 +425,12 @@ def watch_folder(folder):
                 if freq_rounded in entry:
                     print(f"[!] {fname}: {freq_rounded}Hz cycle {cycle_num} already queued -- keeping the first one seen, skipping this.")
                     continue
-                entry[freq_rounded] = ip_values
+                entry[freq_rounded] = (ip_values, estimated)
                 max_seen_cycle[freq_rounded] = max(max_seen_cycle[freq_rounded], cycle_num)
-                missing = [ch for ch in range(1, 9) if ch not in ip_values]
-                note = f" (missing Ch{missing})" if missing else ""
-                print(f"[+] {fname}: {freq_rounded}Hz, cycle {cycle_num} -- queued{note}.")
+                still_missing = [ch for ch in ALL_CHANNELS if ch not in ip_values]
+                est_note = f" (estimated Ch{sorted(estimated)})" if estimated else ""
+                miss_note = f" (missing Ch{still_missing})" if still_missing else ""
+                print(f"[+] {fname}: {freq_rounded}Hz, cycle {cycle_num} -- queued{est_note}{miss_note}.")
 
             try_flush()
             time.sleep(POLL_SECONDS)
