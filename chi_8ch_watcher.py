@@ -301,29 +301,35 @@ def watch_folder(folder):
     """Polls folder every POLL_SECONDS for new .txt files. Keeps only files
     at a frequency in FREQUENCIES (anything else is skipped and never
     written). New files are queued up per cycle number, per frequency, and
-    a row is written once that cycle number is "settled" -- see the module
-    docstring's point 5 for exactly what that means -- so rows come out in
-    ascending cycle-number order even if files land out of order between
-    polls."""
+    written out in ascending cycle-number order -- but NOT assuming cycle
+    numbers are small consecutive integers starting near 1: CHI's per-name
+    counter carries over from however many times that save name has ever
+    been used before (we've seen it start in the thousands), so this always
+    processes the SMALLEST cycle number actually present in pending, not
+    "whatever number comes right after the last one written." A cycle is
+    "settled" and gets flushed once it's either got both frequencies, or a
+    LATER cycle number has shown up for a frequency still missing it (see
+    the module docstring's point 5) -- so a gap in the real numbering never
+    produces a fake blank row, only a genuinely skipped file does."""
     seen = set()
     pending = {}  # cycle_number -> {freq: ip_values}, for cycles not yet written
     max_seen_cycle = {freq: 0 for freq in FREQUENCIES}  # how far each frequency's stream has gotten
-    next_index_to_write = 0  # tracks how many rows have been written so far
+    written_count = 0  # how many rows have been written so far -- drives the mins label, NOT the cycle number
 
     print(f"Watching {folder} for new .txt files ({'/'.join(str(f) for f in FREQUENCIES)} Hz only)... Ctrl+C to stop.\n")
 
     def try_flush():
-        nonlocal next_index_to_write
-        while True:
-            cycle_num = next_index_to_write + 1
-            entry = pending.get(cycle_num, {})
+        nonlocal written_count
+        while pending:
+            cycle_num = min(pending)
+            entry = pending[cycle_num]
             ready = all(freq in entry or max_seen_cycle[freq] > cycle_num for freq in FREQUENCIES)
             if not ready:
                 return
             pending.pop(cycle_num, None)
-            label = label_for_index(next_index_to_write)
+            label = label_for_index(written_count)
             fill_next_row(label, entry)
-            next_index_to_write += 1
+            written_count += 1
 
     while True:
         try:
