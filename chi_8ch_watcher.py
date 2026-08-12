@@ -465,13 +465,17 @@ SPIKE_FILL = PatternFill(start_color="FFC000", end_color="FFC000", fill_type="so
 
 
 def extract_stage_and_cycle(fname):
-    """'60hz_sweat_13.txt' -> ('sweat', 13). '60Hz_sweat 5nM_1.txt' ->
+    """'60hz_sweat_13.txt' -> ('sweat', 13). '60Hz_sweat 5nM_1.bin' ->
     ('sweat 5nM', 1). No trailing _N means cycle 1 (CHI doesn't suffix the
     very first save of a given name). Cycle numbers are only unique WITHIN
     a stage -- CHI restarts the _N counter from 1 every time the save label
     itself changes -- so callers must key on (stage, cycle), never cycle
     alone."""
-    stem = fname[:-4] if fname.lower().endswith(".txt") else fname
+    lower = fname.lower()
+    if lower.endswith(".txt") or lower.endswith(".bin"):
+        stem = fname[:-4]
+    else:
+        stem = fname
     stem = HZ_PREFIX_RE.sub("", stem, count=1)
     m = CYCLE_NUMBER_RE.search(stem)
     if m:
