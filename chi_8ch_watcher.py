@@ -4,82 +4,73 @@ chi_8ch_watcher.py
 (Renamed from chi_10hz_8ch_watcher.py -- it now reads both 10Hz and 60Hz,
 not just 10Hz, so the old name was no longer accurate.)
 
-A continuous folder watcher for CHI's plain-text SWV exports (.txt) -- point
-it at a folder and leave it running during a live overnight/24-hour SWV run
-over 8 channels, split across two sensor types and two frequencies. It
-checks for new .txt files every few seconds, and as each one appears it:
+A continuous folder watcher for CHI's .bin save files -- point it at a
+folder and leave it running during a live overnight/24-hour SWV run over
+8 channels, split across two sensors and two frequencies. It ONLY reads
+.bin files -- .txt exports (or anything else) in the folder are ignored
+entirely, never parsed, never written. This is deliberate: mixing .txt
+and .bin readers for the same run risks the two sources disagreeing, so
+this script reads one format, consistently, for every row.
 
-  1. Reads the file as plain text (CHI's normal auto-exported format --
-     no binary parsing needed, unlike a .bin save with text-export turned
-     off; see chi_bin_to_excel.py for that separate situation).
-  2. Pulls the real "ip" value straight out of each channel's "Results:"
-     section (the Difference ip, e.g. "Channel 5: ... Difference: ...
-     ip = -1.989e-6A"). This is CHI's own computed peak. If a channel has
-     no Difference result at all (CHI's peak-picker gave up on it -- this
-     happens more on a long unattended run than a supervised one), its ip
-     is instead estimated from that channel's raw difference-current curve
-     further down in the same file (same baseline-corrected method
-     chi_swv_to_excel.py and chi_bin_to_excel.py use), rather than left
-     blank -- marked italic in Excel so you can tell it apart from CHI's
-     own number.
-  3. Keeps only files at a frequency in FREQUENCIES (10Hz and 60Hz by
-     default, checked via the "Frequency (Hz) = " line in the file header).
-     Any other frequency is skipped entirely and never written.
-  4. Splits the 8 channels into two sensor-type groups, and writes one
-     block per (frequency, sensor type) combination -- 4 blocks total in
-     the same row:
-       - Ch1-4 -> Agarose Gel Sensor  (agarose-gel-coated)
-       - Ch5-8 -> Normal Sensor       (uncoated / normal type)
-     e.g. "10 Hz - Agarose Gel Sensor", "10 Hz - Normal Sensor",
-          "60 Hz - Agarose Gel Sensor", "60 Hz - Normal Sensor"
-  5. Labels rows in fixed 20-minute increments: "initial reading", then
+It checks for new .bin files every few seconds, and as each one appears it:
+
+  1. Reads CHI's binary save format directly (see the BIN_* constants for
+     the byte layout, reverse-engineered from a matched 4-channel .bin/.txt
+     pair and extrapolated to 8 channels -- confirmed against 5 real
+     8-channel .bin files, see below). CHI's own peak-picked ip is NOT
+     stored in a .bin at all, only the raw curve -- confirmed by
+     exhaustively searching a known .bin for its paired .txt's exact ip
+     values and finding nothing, in any float format (see
+     chi_bin_to_excel.py's docstring for the full story). So every ip
+     value here is an estimate, derived from the raw curve via a
+     baseline-corrected peak read (estimate_peak_from_curve) -- not
+     CHI's own number. Marked italic in Excel as a reminder.
+  2. Keeps only files at a frequency in FREQUENCIES (10Hz and 60Hz by
+     default, read straight out of the binary header). Any other
+     frequency is skipped entirely and never written.
+  3. Splits the 8 channels into two sensor groups, and writes one block
+     per (frequency, sensor) combination -- 4 blocks total in the same
+     row:
+       - Ch1-4 -> Agarose Sensor 1
+       - Ch5-8 -> Agarose Sensor 2
+     e.g. "10 Hz - Agarose Sensor 1", "10 Hz - Agarose Sensor 2",
+          "60 Hz - Agarose Sensor 1", "60 Hz - Agarose Sensor 2"
+  4. Labels rows in fixed 20-minute increments: "initial reading", then
      "20 mins", "40 mins", ... Rows are placed in that order using the
-     cycle number CHI appends to the filename (e.g. "60hz_sweat_13.txt" =
+     cycle number CHI appends to the filename (e.g. "60hz_blank_13.bin" =
      cycle 13) -- NOT file timestamps, which can get scrambled by copying
      files around or OneDrive sync reordering things after the fact.
 
-     Since each row now needs BOTH a 10Hz file and a 60Hz file for the same
+     Since each row needs BOTH a 10Hz file and a 60Hz file for the same
      cycle number, a cycle's row is written once either (a) both
      frequencies' files for that cycle number have arrived, or (b) a LATER
      cycle number has shown up for a frequency that's still missing this
      cycle -- meaning that frequency's file for this cycle isn't coming
      (e.g. the macro skipped it), so the row is written with that block
      left blank rather than waiting forever.
-  6. Detects when you change the save label mid-run -- e.g. spiking the
-     sample partway through, "sweat" -> "sweat 5nM" -- the same way the
+  5. Detects when you change the save label mid-run -- e.g. spiking the
+     sample partway through, "blank" -> "blank 5nM" -- the same way the
      filename encodes a stage change (frequency prefix and trailing cycle
-     number stripped, whatever's left is the stage: "60hz_sweat_13.txt" is
-     stage "sweat" cycle 13; "60Hz_sweat 5nM_1.txt" is stage "sweat 5nM"
+     number stripped, whatever's left is the stage: "60hz_blank_13.bin" is
+     stage "blank" cycle 13; "60Hz_blank 5nM_1.bin" is stage "blank 5nM"
      cycle 1 -- note CHI restarts the _N counter from 1 for each distinct
      label, so cycle numbers are only unique WITHIN a stage, not across
      the whole run). The row where the stage first changes gets the new
-     stage name as its label instead of "N mins" (e.g. "sweat 5nM"), and
-     is highlighted gold in Excel so the spike point is easy to spot at a
+     stage name as its label instead of "N mins" (e.g. "blank 5nM"), and
+     is highlighted gold in Excel so the change point is easy to spot at a
      glance. Every row after that goes back to counting "N mins" from that
      point. All of a stage's cycles are written out (in ascending
      cycle-number order) before any row from the next stage, regardless of
      which order the underlying files happened to arrive in.
 
-EXPECTED FILE FORMAT
----------------------
-Standard CHI SWV .txt export, e.g.:
-
-    Frequency (Hz) = 10
-    ...
-    Results:
-
-    Channel 1:
-    Difference:
-    Ep = -0.230V
-    ip = -2.614e-7A
-    ...
-    Channel 8:
-    Difference:
-    Ep = -0.238V
-    ip = -1.946e-6A
-
-If a file has fewer than 8 "Channel N:" sections, whichever channels are
-missing are just left blank rather than causing an error.
+Stages are ordered by each stage's EARLIEST file creation time, not by the
+order os.listdir() happens to return them in -- directory order is
+alphabetical, and e.g. "10Hz_blank 5nM_1.bin" sorts before "10hz_blank.bin"
+(capital H < lowercase h), which would register a later stage as if it
+came first. Creation time is trustworthy here specifically because this is
+a live folder being watched as CHI writes to it, not a folder that was
+reorganized/copied after the fact (that's the scenario chi_bin_to_excel.py
+had to stop trusting timestamps for).
 
 DAILY USE
 ---------
@@ -89,23 +80,18 @@ run:
     python chi_8ch_watcher.py
 
 It will ask for the folder to watch and the Excel file to write to, then
-run continuously -- checking for new .txt/.bin files every POLL_SECONDS --
-until you close the window (Ctrl+C).
+run continuously -- checking for new .bin files every POLL_SECONDS -- until
+you close the window (Ctrl+C).
 
-READING .bin FILES DIRECTLY (no .txt export)
----------------------------------------------
-If a stage is missing its .txt export (e.g. CHI's auto-text-save setting
-was off), this watcher also reads the named .bin save directly -- same
-approach as chi_bin_to_excel.py: CHI's binary format doesn't store its own
-peak-picked ip, only the raw curve, so every channel from a .bin is always
-an estimate (marked italic, like any other estimated channel here).
-
+BINARY LAYOUT CONFIDENCE
+--------------------------
 The byte layout used to decode a .bin (see the BIN_* constants) was
-reverse-engineered from a 4-channel file and extrapolated to 8 channels by
-assuming the same per-channel pattern continues -- confirmed against 5 real
-8-channel .bin files: the header decodes to sane parameters, the point
-count computed purely from file size matches (Ef-Ei)/Increment exactly,
-and the decoded channel curves are smooth with no NaN/garbage values.
+reverse-engineered from a matched 4-channel .bin/.txt pair, then
+extrapolated to 8 channels by assuming the same per-channel pattern
+continues. Confirmed against 5 real 8-channel .bin files: the header
+decodes to sane parameters, the point count computed purely from file size
+matches (Ef-Ei)/Increment exactly, and the decoded channel curves are
+smooth with no NaN/garbage values.
 """
 
 import os
@@ -123,13 +109,11 @@ DEFAULT_EXCEL_NAME = "8Channel_Results.xlsx"
 SETTINGS_DIR = r"C:\Users\gao22\Documents"
 FREQUENCIES = [10, 60]            # only files at these frequencies are kept, in column order
 STEP_MINUTES = 20                 # minutes between readings
-TOTAL_HOURS = 24                  # run length this labeling scheme is built for
-TOTAL_ROWS = int(TOTAL_HOURS * 60 / STEP_MINUTES) + 1  # +1 for "initial reading" -> 73
 FIRST_LABEL = "initial reading"
 POLL_SECONDS = 5                  # how often to check the folder for new files
 SENSOR_GROUPS = [
-    ("Agarose Gel Sensor", (1, 2, 3, 4)),  # agarose-gel-coated sensors
-    ("Normal Sensor", (5, 6, 7, 8)),       # normal (uncoated) sensors
+    ("Agarose Sensor 1", (1, 2, 3, 4)),
+    ("Agarose Sensor 2", (5, 6, 7, 8)),
 ]
 # --------------------------------------------------------
 
@@ -150,11 +134,11 @@ def prompt_for_excel_path():
     print(f"Writing to: {EXCEL_PATH}\n")
 
 
-def prompt_for_txt_folder():
+def prompt_for_bin_folder():
     last_used = _load_last_used("chi8ch_last_folder")
     default_folder = last_used or ""
     while True:
-        typed = input(f"Folder to watch for .txt files{f' [{default_folder}]' if default_folder else ''}: ").strip().strip('"')
+        typed = input(f"Folder to watch for .bin files{f' [{default_folder}]' if default_folder else ''}: ").strip().strip('"')
         folder = typed or default_folder
         if folder and os.path.isdir(folder):
             _save_last_used("chi8ch_last_folder", folder)
@@ -184,25 +168,6 @@ def _save_last_used(key, value):
         pass
 
 
-# ------------------------------------------------------------------
-# Parsing CHI's plain-text SWV export
-# ------------------------------------------------------------------
-FREQUENCY_RE = re.compile(r"Frequency\s*\(Hz\)\s*=\s*([\d.]+)")
-DATA_TABLE_HEADER_RE = re.compile(r"^Potential/V.*$", re.MULTILINE)
-
-# Matches each "Channel N:" section up through its first "Difference:"
-# block's ip value, e.g.:
-#   Channel 5:
-#   Difference:
-#   Ep = -0.238V
-#   ip = -1.989e-6A
-CHANNEL_IP_RE = re.compile(
-    r"Channel\s+(\d+):\s*\n"
-    r"Difference:\s*\n"
-    r"Ep\s*=\s*[-\d.]+V\s*\n"
-    r"ip\s*=\s*([-\d.eE]+)A"
-)
-
 ALL_CHANNELS = tuple(ch for _, channels in SENSOR_GROUPS for ch in channels)
 
 
@@ -228,86 +193,9 @@ def estimate_peak_from_curve(curve, potentials, edge_points=8):
     return max(residuals, key=abs)
 
 
-def compute_difference_peak_from_raw(text, channel):
-    """Fallback for when CHI's own peak-picker didn't report a Difference
-    ip for this channel. The raw per-point difference-current curve (the
-    "i{ch}d" column in the data table) is usually still there -- pull it
-    out and run it through estimate_peak_from_curve. Returns None if the
-    table or column is missing."""
-    header_match = DATA_TABLE_HEADER_RE.search(text)
-    if not header_match:
-        return None
-    col_index = 1 + (channel - 1) * 3  # columns: Potential, i1d,i1f,i1r, i2d,i2f,i2r, ...
-    potentials, values = [], []
-    for line in text[header_match.end():].splitlines():
-        line = line.strip()
-        if not line or "," not in line:
-            continue
-        parts = line.split(",")
-        if len(parts) <= col_index:
-            continue
-        try:
-            potential = float(parts[0])
-            value = float(parts[col_index])
-        except ValueError:
-            continue
-        potentials.append(potential)
-        values.append(value)
-    return estimate_peak_from_curve(values, potentials)
-
-
-def parse_swv_txt_file(filepath):
-    """Reads a CHI SWV .txt export. Returns (frequency_hz, {channel_num:
-    ip_value}, {estimated channel numbers}) -- CHI's own computed ip from
-    each channel's Difference section where available, falling back to
-    compute_difference_peak_from_raw (and marked as estimated) for any
-    channel CHI didn't report one for. Returns (None, {}, set()) if this
-    doesn't look like a CHI SWV text file."""
-    try:
-        with open(filepath, "r", errors="ignore") as f:
-            text = f.read()
-    except OSError:
-        return None, {}, set()
-
-    if "Square Wave Voltammetry" not in text:
-        return None, {}, set()
-
-    freq_match = FREQUENCY_RE.search(text)
-    if not freq_match:
-        return None, {}, set()
-    frequency = float(freq_match.group(1))
-
-    ip_values = {}
-    for ch_match in CHANNEL_IP_RE.finditer(text):
-        ch_num = int(ch_match.group(1))
-        ip_val = float(ch_match.group(2))
-        ip_values[ch_num] = ip_val
-
-    estimated = set()
-    for ch in ALL_CHANNELS:
-        if ch not in ip_values:
-            fallback = compute_difference_peak_from_raw(text, ch)
-            if fallback is not None:
-                ip_values[ch] = fallback
-                estimated.add(ch)
-
-    if not ip_values:
-        return None, {}, set()
-
-    return frequency, ip_values, estimated
-
-
 # ------------------------------------------------------------------
-# Reading CHI's .bin save files directly (no .txt export available)
+# Reading CHI's .bin save files directly -- see module docstring
 # ------------------------------------------------------------------
-# Layout reverse-engineered from a matched 4-channel .bin/.txt pair (see
-# chi_bin_to_excel.py's docstring for how), extrapolated to 8 channels by
-# assuming the pattern continues: channel 1 gets its own dedicated block
-# of (d,f,r) triplets, then every other channel follows in the same
-# row-major layout, one (d,f,r) triplet per channel per data point.
-# Confirmed against 5 real 8-channel .bin files -- see the module
-# docstring. Every value is a little-endian 32-bit float.
-#
 #   bytes 0-1690     fixed-size header (Ei/Ef/Increment/Frequency/etc at
 #                     fixed offsets below) -- assumed identical regardless
 #                     of channel count, since it's unrelated to how many
@@ -328,12 +216,11 @@ BIN_INCRE_OFFSET = 1111
 
 def parse_swv_bin_file(filepath):
     """Reads a CHI .bin save file directly. Returns (frequency_hz,
-    {channel_num: ip_value}, {estimated channel numbers}) in the same shape
-    as parse_swv_txt_file, or (None, {}, set()) if this doesn't look like a
-    CHI SWV .bin, or it has zero data points (e.g. an aborted run). Every
-    channel comes back estimated -- CHI's own peak-picked ip isn't stored
-    in the .bin at all, only the raw curve (see chi_bin_to_excel.py's
-    docstring for how that was confirmed)."""
+    {channel_num: ip_value}, {estimated channel numbers}) -- every channel
+    comes back estimated, since CHI's own peak-picked ip isn't stored in
+    the .bin at all (see module docstring). Returns (None, {}, set()) if
+    this doesn't look like a CHI SWV .bin, or it has zero data points
+    (e.g. an aborted run)."""
     with open(filepath, "rb") as f:
         data = f.read()
 
@@ -372,7 +259,7 @@ def parse_swv_bin_file(filepath):
 
 
 # ------------------------------------------------------------------
-# Excel template -- one block per (frequency, sensor type) combination,
+# Excel template -- one block per (frequency, sensor) combination,
 # in FREQUENCIES x SENSOR_GROUPS order, left to right.
 # ------------------------------------------------------------------
 BLOCKS = [(freq, name, channels) for freq in FREQUENCIES for name, channels in SENSOR_GROUPS]
@@ -405,6 +292,7 @@ def find_next_empty_row(ws):
 
 
 ESTIMATED_FONT = Font(italic=True)
+SPIKE_FILL = PatternFill(start_color="FFC000", end_color="FFC000", fill_type="solid")
 
 
 def write_ip_row(ws, row, col_start, ip_values, estimated_channels, channels):
@@ -420,7 +308,7 @@ def fill_next_row(label, freq_data, spike=False):
     frequency missing from this dict leaves both of that frequency's
     blocks blank for this row. spike=True highlights the row's Run cells
     gold -- used for the first row of a new stage (see extract_stage_and_cycle),
-    e.g. the point a sample was spiked."""
+    e.g. the point a sample was spiked/relabeled."""
     if os.path.exists(EXCEL_PATH):
         wb = load_workbook(EXCEL_PATH)
         ws = wb["8Ch Data"] if "8Ch Data" in wb.sheetnames else wb.active
@@ -453,7 +341,7 @@ def fill_next_row(label, freq_data, spike=False):
     have = ", ".join(f"{freq}Hz" for freq in FREQUENCIES if (freq_data.get(freq) or ({}, None))[0])
     missing = ", ".join(f"{freq}Hz" for freq in FREQUENCIES if not (freq_data.get(freq) or ({}, None))[0])
     note = f"  [missing: {missing}]" if missing else ""
-    spike_note = "  [SPIKE POINT]" if spike else ""
+    spike_note = "  [STAGE CHANGE]" if spike else ""
     print(f'Filled row {row} ("{label}") -- have: {have or "(none)"}{note}{spike_note}')
 
 
@@ -461,21 +349,15 @@ def fill_next_row(label, freq_data, spike=False):
 HZ_PREFIX_RE = re.compile(r"^\s*\d+\s*hz_?\s*", re.IGNORECASE)
 CYCLE_NUMBER_RE = re.compile(r"_(\d+)$")
 
-SPIKE_FILL = PatternFill(start_color="FFC000", end_color="FFC000", fill_type="solid")
-
 
 def extract_stage_and_cycle(fname):
-    """'60hz_sweat_13.txt' -> ('sweat', 13). '60Hz_sweat 5nM_1.bin' ->
-    ('sweat 5nM', 1). No trailing _N means cycle 1 (CHI doesn't suffix the
+    """'60hz_blank_13.bin' -> ('blank', 13). '60Hz_blank 5nM_1.bin' ->
+    ('blank 5nM', 1). No trailing _N means cycle 1 (CHI doesn't suffix the
     very first save of a given name). Cycle numbers are only unique WITHIN
     a stage -- CHI restarts the _N counter from 1 every time the save label
     itself changes -- so callers must key on (stage, cycle), never cycle
     alone."""
-    lower = fname.lower()
-    if lower.endswith(".txt") or lower.endswith(".bin"):
-        stem = fname[:-4]
-    else:
-        stem = fname
+    stem = fname[:-4] if fname.lower().endswith(".bin") else fname
     stem = HZ_PREFIX_RE.sub("", stem, count=1)
     m = CYCLE_NUMBER_RE.search(stem)
     if m:
@@ -484,28 +366,19 @@ def extract_stage_and_cycle(fname):
 
 
 def watch_folder(folder):
-    """Polls folder every POLL_SECONDS for new .txt/.bin files. Keeps only
-    files at a frequency in FREQUENCIES (anything else is skipped and never
-    written). Files are grouped by (stage, cycle_number) -- see
-    extract_stage_and_cycle -- and written out stage by stage, ascending
-    cycle number within a stage. A cycle is "settled" and gets flushed once
-    it's either got both frequencies, or a LATER cycle in the SAME stage
-    (or any cycle in a chronologically LATER stage) has shown up for a
-    frequency still missing it here -- meaning that frequency's file for
-    this cycle isn't coming, so the row is written with that block left
-    blank rather than waiting forever. The first row of a stage after the
-    very first one overall is labeled with the stage name itself and
-    highlighted gold (see fill_next_row) -- this is what marks a
-    spike/relabel partway through the run.
-
-    Stages are ordered by each stage's EARLIEST file creation time, not by
-    the order os.listdir() happens to return them in -- directory order is
-    alphabetical, and e.g. "10Hz_sweat 5nM_1.txt" sorts before
-    "10hz_sweat.txt" (capital H < lowercase h), which would register the
-    spike stage as if it came first. Creation time is trustworthy here
-    specifically because this is a live folder being watched as CHI writes
-    to it, not a folder that was reorganized/copied after the fact (that's
-    the scenario chi_bin_to_excel.py had to stop trusting timestamps for)."""
+    """Polls folder every POLL_SECONDS for new .bin files (anything else --
+    .txt, .csv, whatever -- is ignored entirely and never read). Keeps only
+    files at a frequency in FREQUENCIES. Files are grouped by (stage,
+    cycle_number) -- see extract_stage_and_cycle -- and written out stage
+    by stage, ascending cycle number within a stage. A cycle is "settled"
+    and gets flushed once it's either got both frequencies, or a LATER
+    cycle in the SAME stage (or any cycle in a chronologically LATER
+    stage) has shown up for a frequency still missing it here -- meaning
+    that frequency's file for this cycle isn't coming, so the row is
+    written with that block left blank rather than waiting forever. The
+    first row of a stage after the very first one overall is labeled with
+    the stage name itself and highlighted gold (see fill_next_row) -- this
+    is what marks a spike/relabel partway through the run."""
     seen = set()
     pending = {}            # stage -> {cycle_num: {freq: (ip_values, estimated_channels)}}
     max_seen_cycle = {}     # stage -> {freq: highest cycle number seen for that stage+freq}
@@ -513,7 +386,7 @@ def watch_folder(folder):
     freq_latest_stage = {freq: None for freq in FREQUENCIES}  # each freq's chronologically furthest-along stage
     state = {"current_stage": None, "stage_written_count": 0, "any_written": False}
 
-    print(f"Watching {folder} for new files ({'/'.join(str(f) for f in FREQUENCIES)} Hz only)... Ctrl+C to stop.\n")
+    print(f"Watching {folder} for new .bin files ({'/'.join(str(f) for f in FREQUENCIES)} Hz only)... Ctrl+C to stop.\n")
 
     def stage_order():
         return sorted(stage_first_ctime, key=stage_first_ctime.get)
@@ -568,20 +441,14 @@ def watch_folder(folder):
     while True:
         try:
             for fname in sorted(os.listdir(folder)):
-                lower = fname.lower()
-                is_txt = lower.endswith(".txt")
-                is_bin = lower.endswith(".bin")
-                if not (is_txt or is_bin) or fname in seen:
+                if not fname.lower().endswith(".bin") or fname in seen:
                     continue
                 seen.add(fname)
                 fpath = os.path.join(folder, fname)
 
-                if is_txt:
-                    frequency, ip_values, estimated = parse_swv_txt_file(fpath)
-                else:
-                    frequency, ip_values, estimated = parse_swv_bin_file(fpath)
+                frequency, ip_values, estimated = parse_swv_bin_file(fpath)
                 if frequency is None:
-                    print(f"[!] {fname}: couldn't read this as a CHI SWV file (or it has no data) -- skipped.")
+                    print(f"[!] {fname}: couldn't read this as a CHI SWV .bin (or it has no data) -- skipped.")
                     continue
 
                 freq_rounded = int(round(frequency))
@@ -607,10 +474,7 @@ def watch_folder(folder):
                 entry[freq_rounded] = (ip_values, estimated)
                 max_seen_cycle.setdefault(stage, {})[freq_rounded] = max(
                     max_seen_cycle.setdefault(stage, {}).get(freq_rounded, 0), cycle_num)
-                still_missing = [ch for ch in ALL_CHANNELS if ch not in ip_values]
-                est_note = f" (estimated Ch{sorted(estimated)})" if estimated else ""
-                miss_note = f" (missing Ch{still_missing})" if still_missing else ""
-                print(f"[+] {fname}: {freq_rounded}Hz, stage \"{stage}\" cycle {cycle_num} -- queued{est_note}{miss_note}.")
+                print(f"[+] {fname}: {freq_rounded}Hz, stage \"{stage}\" cycle {cycle_num} -- queued.")
 
             try_flush()
             time.sleep(POLL_SECONDS)
@@ -629,6 +493,6 @@ if __name__ == "__main__":
         prompt_for_excel_path()
         watch_folder(folder)
     else:
-        folder = prompt_for_txt_folder()
+        folder = prompt_for_bin_folder()
         prompt_for_excel_path()
         watch_folder(folder)
