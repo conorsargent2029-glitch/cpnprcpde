@@ -7,10 +7,21 @@ not just 10Hz, so the old name was no longer accurate.)
 A continuous folder watcher for CHI's .bin save files -- point it at a
 folder and leave it running during a live overnight/24-hour SWV run over
 8 channels, split across two sensors and two frequencies. It ONLY reads
-.bin files -- .txt exports (or anything else) in the folder are ignored
-entirely, never parsed, never written. This is deliberate: mixing .txt
-and .bin readers for the same run risks the two sources disagreeing, so
-this script reads one format, consistently, for every row.
+files matching CHI's auto-named per-run save pattern, e.g.
+"20260813_172423_SWV.bin" -- CHI writes one of these automatically for
+every single run, regardless of whether the macro's "save:" command also
+wrote a separately-labeled file. Any other file in the folder (.txt,
+custom-labeled .bin saves, anything else) is ignored entirely, never
+parsed, never written -- this project's earlier attempt to also read
+custom-labeled saves broke when some runs turned out not to have gotten
+one (the custom label didn't fire for every cycle), so the auto-named
+save is the one reliable source: it's the only file guaranteed to exist
+for every single run.
+
+Because auto-named files carry no label text (just a timestamp), there is
+no round/stage/spike detection here -- rows are just numbered in fixed
+20-minute increments in chronological order: "initial reading", "20
+mins", "40 mins", ...
 
 It checks for new .bin files every few seconds, and as each one appears it:
 
@@ -35,42 +46,14 @@ It checks for new .bin files every few seconds, and as each one appears it:
        - Ch5-8 -> Agarose Sensor 2
      e.g. "10 Hz - Agarose Sensor 1", "10 Hz - Agarose Sensor 2",
           "60 Hz - Agarose Sensor 1", "60 Hz - Agarose Sensor 2"
-  4. Labels rows in fixed 20-minute increments: "initial reading", then
-     "20 mins", "40 mins", ... Rows are placed in that order using the
-     cycle number CHI appends to the filename (e.g. "60hz_blank_13.bin" =
-     cycle 13) -- NOT file timestamps, which can get scrambled by copying
-     files around or OneDrive sync reordering things after the fact.
-
-     Since each row needs BOTH a 10Hz file and a 60Hz file for the same
-     cycle number, a cycle's row is written once either (a) both
-     frequencies' files for that cycle number have arrived, or (b) a LATER
-     cycle number has shown up for a frequency that's still missing this
-     cycle -- meaning that frequency's file for this cycle isn't coming
-     (e.g. the macro skipped it), so the row is written with that block
-     left blank rather than waiting forever.
-  5. Detects when you change the save label mid-run -- e.g. spiking the
-     sample partway through, "blank" -> "blank 5nM" -- the same way the
-     filename encodes a stage change (frequency prefix and trailing cycle
-     number stripped, whatever's left is the stage: "60hz_blank_13.bin" is
-     stage "blank" cycle 13; "60Hz_blank 5nM_1.bin" is stage "blank 5nM"
-     cycle 1 -- note CHI restarts the _N counter from 1 for each distinct
-     label, so cycle numbers are only unique WITHIN a stage, not across
-     the whole run). The row where the stage first changes gets the new
-     stage name as its label instead of "N mins" (e.g. "blank 5nM"), and
-     is highlighted gold in Excel so the change point is easy to spot at a
-     glance. Every row after that goes back to counting "N mins" from that
-     point. All of a stage's cycles are written out (in ascending
-     cycle-number order) before any row from the next stage, regardless of
-     which order the underlying files happened to arrive in.
-
-Stages are ordered by each stage's EARLIEST file creation time, not by the
-order os.listdir() happens to return them in -- directory order is
-alphabetical, and e.g. "10Hz_blank 5nM_1.bin" sorts before "10hz_blank.bin"
-(capital H < lowercase h), which would register a later stage as if it
-came first. Creation time is trustworthy here specifically because this is
-a live folder being watched as CHI writes to it, not a folder that was
-reorganized/copied after the fact (that's the scenario chi_bin_to_excel.py
-had to stop trusting timestamps for).
+  4. Pairs a 10Hz file with the 60Hz file that landed within
+     GROUP_GAP_SECONDS of it (parsed straight out of each auto-named
+     filename's own embedded timestamp -- reliable regardless of OS file
+     metadata, since CHI bakes it into the name at save time) into one
+     row. If a file's pair never shows up before either a same-frequency
+     file arrives (meaning the next cycle has started) or GROUP_GAP_SECONDS
+     of real time passes with nothing new, the row is written anyway with
+     that block left blank rather than waiting forever.
 
 DAILY USE
 ---------
@@ -99,9 +82,10 @@ import re
 import struct
 import sys
 import time
+from datetime import datetime
 
 from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Font, PatternFill
+from openpyxl.styles import Font
 
 # ----------------------- CONFIG -----------------------
 EXCEL_DIR = r"C:\Users\gao22\Documents"
@@ -111,6 +95,7 @@ FREQUENCIES = [10, 60]            # only files at these frequencies are kept, in
 STEP_MINUTES = 20                 # minutes between readings
 FIRST_LABEL = "initial reading"
 POLL_SECONDS = 5                  # how often to check the folder for new files
+GROUP_GAP_SECONDS = 200.0         # max span between a cycle's 10Hz/60Hz saves to still count as one row
 SENSOR_GROUPS = [
     ("Agarose Sensor 1", (1, 2, 3, 4)),
     ("Agarose Sensor 2", (5, 6, 7, 8)),
@@ -292,7 +277,6 @@ def find_next_empty_row(ws):
 
 
 ESTIMATED_FONT = Font(italic=True)
-SPIKE_FILL = PatternFill(start_color="FFC000", end_color="FFC000", fill_type="solid")
 
 
 def write_ip_row(ws, row, col_start, ip_values, estimated_channels, channels):
@@ -303,12 +287,10 @@ def write_ip_row(ws, row, col_start, ip_values, estimated_channels, channels):
             cell.font = ESTIMATED_FONT
 
 
-def fill_next_row(label, freq_data, spike=False):
+def fill_next_row(label, freq_data):
     """freq_data: {freq: (ip_values_dict, estimated_channels_set)} -- a
     frequency missing from this dict leaves both of that frequency's
-    blocks blank for this row. spike=True highlights the row's Run cells
-    gold -- used for the first row of a new stage (see extract_stage_and_cycle),
-    e.g. the point a sample was spiked/relabeled."""
+    blocks blank for this row."""
     if os.path.exists(EXCEL_PATH):
         wb = load_workbook(EXCEL_PATH)
         ws = wb["8Ch Data"] if "8Ch Data" in wb.sheetnames else wb.active
@@ -319,9 +301,7 @@ def fill_next_row(label, freq_data, spike=False):
     row = find_next_empty_row(ws)
     for i, (freq, sensor_name, channels) in enumerate(BLOCKS):
         col = block_start_col(i)
-        label_cell = ws.cell(row=row, column=col, value=label)
-        if spike:
-            label_cell.fill = SPIKE_FILL
+        ws.cell(row=row, column=col, value=label)
         ip_values, estimated_channels = freq_data.get(freq) or ({}, set())
         write_ip_row(ws, row, col_start=col + 1, ip_values=ip_values,
                      estimated_channels=estimated_channels, channels=channels)
@@ -341,108 +321,80 @@ def fill_next_row(label, freq_data, spike=False):
     have = ", ".join(f"{freq}Hz" for freq in FREQUENCIES if (freq_data.get(freq) or ({}, None))[0])
     missing = ", ".join(f"{freq}Hz" for freq in FREQUENCIES if not (freq_data.get(freq) or ({}, None))[0])
     note = f"  [missing: {missing}]" if missing else ""
-    spike_note = "  [STAGE CHANGE]" if spike else ""
-    print(f'Filled row {row} ("{label}") -- have: {have or "(none)"}{note}{spike_note}')
+    print(f'Filled row {row} ("{label}") -- have: {have or "(none)"}{note}')
 
 
 # ------------------------------------------------------------------
-HZ_PREFIX_RE = re.compile(r"^\s*\d+\s*hz_?\s*", re.IGNORECASE)
-CYCLE_NUMBER_RE = re.compile(r"_(\d+)$")
+# CHI's auto-named per-run save, e.g. "20260813_172423_SWV.bin" -- the one
+# file guaranteed to exist for every run, whether or not the macro's
+# "save:" command also wrote a custom-labeled file. The date/time is
+# embedded straight in the filename, so it doesn't depend on OS file
+# metadata (creation/modified time), which can get reordered by copying
+# files around or OneDrive sync.
+AUTO_NAME_RE = re.compile(r"^(\d{8})_(\d{6})_SWV\.bin$", re.IGNORECASE)
 
 
-def extract_stage_and_cycle(fname):
-    """'60hz_blank_13.bin' -> ('blank', 13). '60Hz_blank 5nM_1.bin' ->
-    ('blank 5nM', 1). No trailing _N means cycle 1 (CHI doesn't suffix the
-    very first save of a given name). Cycle numbers are only unique WITHIN
-    a stage -- CHI restarts the _N counter from 1 every time the save label
-    itself changes -- so callers must key on (stage, cycle), never cycle
-    alone."""
-    stem = fname[:-4] if fname.lower().endswith(".bin") else fname
-    stem = HZ_PREFIX_RE.sub("", stem, count=1)
-    m = CYCLE_NUMBER_RE.search(stem)
-    if m:
-        return stem[:m.start()].strip(), int(m.group(1))
-    return stem.strip(), 1
+def parse_auto_timestamp(fname):
+    """'20260813_172423_SWV.bin' -> epoch seconds. Returns None if fname
+    doesn't match CHI's auto-named pattern."""
+    m = AUTO_NAME_RE.match(fname)
+    if not m:
+        return None
+    dt = datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
+    return dt.timestamp()
+
+
+def label_for_index(index):
+    if index == 0:
+        return FIRST_LABEL
+    return f"{index * STEP_MINUTES} mins"
 
 
 def watch_folder(folder):
-    """Polls folder every POLL_SECONDS for new .bin files (anything else --
-    .txt, .csv, whatever -- is ignored entirely and never read). Keeps only
-    files at a frequency in FREQUENCIES. Files are grouped by (stage,
-    cycle_number) -- see extract_stage_and_cycle -- and written out stage
-    by stage, ascending cycle number within a stage. A cycle is "settled"
-    and gets flushed once it's either got both frequencies, or a LATER
-    cycle in the SAME stage (or any cycle in a chronologically LATER
-    stage) has shown up for a frequency still missing it here -- meaning
-    that frequency's file for this cycle isn't coming, so the row is
-    written with that block left blank rather than waiting forever. The
-    first row of a stage after the very first one overall is labeled with
-    the stage name itself and highlighted gold (see fill_next_row) -- this
-    is what marks a spike/relabel partway through the run."""
+    """Polls folder every POLL_SECONDS for new files matching CHI's
+    auto-named save pattern (AUTO_NAME_RE) -- anything else (.txt,
+    custom-labeled .bin saves, anything) is ignored entirely and never
+    read. Keeps only files at a frequency in FREQUENCIES. A 10Hz file is
+    paired with the 60Hz file whose embedded timestamp is within
+    GROUP_GAP_SECONDS of it into one row -- if a same-frequency file
+    arrives before its pair does (meaning the next cycle has started), or
+    GROUP_GAP_SECONDS of real time passes with the group otherwise idle,
+    the row is written with whichever frequencies it actually got, the
+    rest left blank. Rows are numbered "initial reading", "20 mins", "40
+    mins", ... in the order they're written -- there's no label text to
+    read a round/stage/spike from here, only a timestamp."""
     seen = set()
-    pending = {}            # stage -> {cycle_num: {freq: (ip_values, estimated_channels)}}
-    max_seen_cycle = {}     # stage -> {freq: highest cycle number seen for that stage+freq}
-    stage_first_ctime = {}  # stage -> earliest file creation time seen for that stage
-    freq_latest_stage = {freq: None for freq in FREQUENCIES}  # each freq's chronologically furthest-along stage
-    state = {"current_stage": None, "stage_written_count": 0, "any_written": False}
+    current_group = None  # {"freq_data": {freq: (ip,estimated)}, "freq_names": {freq: fname}, "last_time": ts}
+    written_count = 0
 
-    print(f"Watching {folder} for new .bin files ({'/'.join(str(f) for f in FREQUENCIES)} Hz only)... Ctrl+C to stop.\n")
+    print(f"Watching {folder} for new auto-named .bin files ({'/'.join(str(f) for f in FREQUENCIES)} Hz only)... Ctrl+C to stop.\n")
 
-    def stage_order():
-        return sorted(stage_first_ctime, key=stage_first_ctime.get)
-
-    def try_flush():
-        order = stage_order()
-        if state["current_stage"] is None:
-            if not order:
-                return
-            state["current_stage"] = order[0]
-
-        while True:
-            stage = state["current_stage"]
-            stage_pending = pending.get(stage, {})
-            if not stage_pending:
-                # Nothing queued for this stage right now. Only safe to move on
-                # once a chronologically LATER stage is already known to exist --
-                # otherwise this might just be the current stage still in progress.
-                order = stage_order()
-                idx = order.index(stage)
-                if idx + 1 < len(order):
-                    state["current_stage"] = order[idx + 1]
-                    state["stage_written_count"] = 0
-                    continue
-                return
-
-            cycle_num = min(stage_pending)
-            entry = stage_pending[cycle_num]
-
-            def freq_settled(freq):
-                if freq in entry:
-                    return True
-                if max_seen_cycle.get(stage, {}).get(freq, 0) > cycle_num:
-                    return True
-                latest = freq_latest_stage[freq]
-                return latest is not None and stage_first_ctime[latest] > stage_first_ctime[stage]
-
-            if not all(freq_settled(freq) for freq in FREQUENCIES):
-                return
-
-            del stage_pending[cycle_num]
-            if not state["any_written"]:
-                label, spike = FIRST_LABEL, False
-            elif state["stage_written_count"] == 0:
-                label, spike = stage, True
-            else:
-                label, spike = f"{state['stage_written_count'] * STEP_MINUTES} mins", False
-            fill_next_row(label, entry, spike=spike)
-            state["any_written"] = True
-            state["stage_written_count"] += 1
+    def flush_group():
+        nonlocal current_group, written_count
+        if current_group is None:
+            return
+        if not any(current_group["freq_data"].values()):
+            names = ", ".join(f"{f}Hz: {n}" for f, n in current_group["freq_names"].items())
+            print(f"Skipped empty run (no data) -- {names or '(no files)'}")
+            current_group = None
+            return
+        fill_next_row(label_for_index(written_count), current_group["freq_data"])
+        written_count += 1
+        current_group = None
 
     while True:
         try:
-            for fname in sorted(os.listdir(folder)):
-                if not fname.lower().endswith(".bin") or fname in seen:
+            candidates = []
+            for fname in os.listdir(folder):
+                if fname in seen:
                     continue
+                ts = parse_auto_timestamp(fname)
+                if ts is None:
+                    continue
+                candidates.append((ts, fname))
+            candidates.sort()
+
+            for ts, fname in candidates:
                 seen.add(fname)
                 fpath = os.path.join(folder, fname)
 
@@ -456,30 +408,26 @@ def watch_folder(folder):
                     print(f"[-] {fname}: {freq_rounded} Hz (not in {FREQUENCIES}) -- ignored.")
                     continue
 
-                stage, cycle_num = extract_stage_and_cycle(fname)
-                try:
-                    ctime = os.path.getctime(fpath)
-                except OSError:
-                    ctime = time.time()
-                if stage not in stage_first_ctime or ctime < stage_first_ctime[stage]:
-                    stage_first_ctime[stage] = ctime
-                latest = freq_latest_stage[freq_rounded]
-                if latest is None or stage_first_ctime[stage] > stage_first_ctime[latest]:
-                    freq_latest_stage[freq_rounded] = stage
+                if current_group is not None:
+                    gap = ts - current_group["last_time"]
+                    if freq_rounded in current_group["freq_data"] or gap > GROUP_GAP_SECONDS:
+                        flush_group()
 
-                entry = pending.setdefault(stage, {}).setdefault(cycle_num, {})
-                if freq_rounded in entry:
-                    print(f"[!] {fname}: {freq_rounded}Hz stage \"{stage}\" cycle {cycle_num} already queued -- keeping the first one seen, skipping this.")
-                    continue
-                entry[freq_rounded] = (ip_values, estimated)
-                max_seen_cycle.setdefault(stage, {})[freq_rounded] = max(
-                    max_seen_cycle.setdefault(stage, {}).get(freq_rounded, 0), cycle_num)
-                print(f"[+] {fname}: {freq_rounded}Hz, stage \"{stage}\" cycle {cycle_num} -- queued.")
+                if current_group is None:
+                    current_group = {"freq_data": {}, "freq_names": {}, "last_time": ts}
+                else:
+                    current_group["last_time"] = ts
+                current_group["freq_data"][freq_rounded] = (ip_values, estimated)
+                current_group["freq_names"][freq_rounded] = fname
+                print(f"[+] {fname}: {freq_rounded}Hz -- queued.")
 
-            try_flush()
+            if current_group is not None and (time.time() - current_group["last_time"]) > GROUP_GAP_SECONDS:
+                flush_group()
+
             time.sleep(POLL_SECONDS)
 
         except KeyboardInterrupt:
+            flush_group()
             print("\nStopped watching.")
             break
 
